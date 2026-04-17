@@ -1,0 +1,4 @@
+# Pinned to versions verified working on 10.128.58.70 (Rocky 9.7, Python 3.11)
+mcp>=1.27.0
+paramiko>=4.0.0
+pydantic>=2.12.0

@@ -1,0 +1,20 @@
+[project]
+name = "ssh-mcp"
+version = "2.0.0"
+description = "SSH MCP server - remote server management via SSH over MCP protocol"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.27.0",
+    "paramiko>=4.0.0",
+    "pydantic>=2.12.0",
+]
+
+[project.scripts]
+ssh-mcp = "ssh_mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["ssh_mcp_server"]

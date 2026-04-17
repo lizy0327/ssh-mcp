@@ -1,0 +1,22 @@
+[Unit]
+Description=SSH MCP Server - Remote SSH management via MCP protocol
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/ssh-mcp
+ExecStart=/opt/ssh-mcp/venv/bin/python3.11 /opt/ssh-mcp/ssh_mcp_server.py --transport sse --host 0.0.0.0 --port 9876
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+Environment=SSH_MCP_PORT=9876
+Environment=SSH_MCP_HOST=0.0.0.0
+Environment=SSH_MCP_CREDENTIALS=/opt/ssh-mcp/credentials.json
+
+[Install]
+WantedBy=multi-user.target

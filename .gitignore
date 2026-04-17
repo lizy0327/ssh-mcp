@@ -1,0 +1,38 @@
+# Credentials - NEVER commit
+credentials.json
+credentials.json.bak
+credentials.json.bak.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime artifacts
+*.log
+*.pid
+.deployed_version
+
+# Backup files (the service creates these; do not commit)
+*.bak
+*.bak.*
+*.broken
