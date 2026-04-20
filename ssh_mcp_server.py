@@ -1014,8 +1014,7 @@ async def ssh_credential_save(params: CredentialSaveInput) -> str:
 async def ssh_credential_list() -> str:
     """List all saved SSH credentials from the local credential store.
 
-    Shows host IDs, names, IPs, usernames, and descriptions.
-    Passwords are masked for security.
+    Shows host IDs, names, IPs, usernames, passwords, and descriptions.
     Use the numeric ID (e.g., "1", "2") or name to connect to a host.
     """
     creds = _load_credentials()
@@ -1027,43 +1026,43 @@ async def ssh_credential_list() -> str:
             indent=2,
         )
 
-    result = []
+    # 构建结构化的主机列表，包含所有字段（密码和类型也显示）
+    host_list = []
     for idx, (name, info) in enumerate(hosts.items(), start=1):
-        result.append(
-            {
-                "id": idx,
-                "name": name,
-                "host": info.get("host", ""),
-                "port": info.get("port", 22),
-                "username": info.get("username", ""),
-                "password": "***masked***",
-                "description": info.get("description", ""),
-                "device_type": info.get("device_type", "linux"),
-            }
+        host_list.append({
+            "id": idx,
+            "name": name,
+            "host": info.get("host", ""),
+            "port": info.get("port", 22),
+            "username": info.get("username", ""),
+            "password": info.get("password", ""),  # 密码明文显示
+            "description": info.get("description", ""),
+            "device_type": info.get("device_type", "linux"),
+        })
+
+    # 构建 Markdown 表格，美观且所有字段都显示
+    lines = []
+    lines.append("| ID | 名称 | IP 地址 | 端口 | 用户名 | 密码 | 类型 | 描述 |")
+    lines.append("|----|------|---------|------|--------|------|------|------|")
+    for h in host_list:
+        row = "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            h["id"], h["name"], h["host"], h["port"],
+            h["username"], h["password"], h["device_type"], h["description"]
         )
+        lines.append(row)
+    markdown_table = "\n".join(lines)
 
-    # Build table output for display
-    table_lines = []
-    header = "{:<4} {:<20} {:<16} {:<6} {:<10} {:<30} {}".format("ID", "名称", "IP 地址", "端口", "用户名", "描述", "类型")
-    table_lines.append(header)
-    table_lines.append("-" * 110)
-    for idx, (name, info) in enumerate(hosts.items(), start=1):
-        host = info.get("host", "")
-        port = info.get("port", 22)
-        username = info.get("username", "")
-        desc = info.get("description", "")
-        device_type = info.get("device_type", "linux")
-        row = "{:<4} {:<20} {:<16} {:<6} {:<10} {:<30} {}".format(idx, name, host, port, username, desc, device_type)
-        table_lines.append(row)
-    table_output = chr(10).join(table_lines)
-
-    json_output = json.dumps(
-        {"success": True, "count": len(result), "hosts": result},
+    # 返回 JSON，包含 Markdown 表格和原始数据，确保所有字段完整显示
+    return json.dumps(
+        {
+            "success": True,
+            "message": f"Found {len(host_list)} saved credential(s).",
+            "table": markdown_table,
+            "all_hosts": host_list,
+        },
         indent=2,
         ensure_ascii=False,
     )
-
-    return table_output + chr(10) + chr(10) + json_output
 
 
 @mcp.tool(
