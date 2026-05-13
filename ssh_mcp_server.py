@@ -22,7 +22,10 @@ import os
 import platform
 import re
 import sys
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows: fcntl not available, file locking skipped
 import time
 import uuid
 from pathlib import Path
@@ -36,7 +39,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # Version info
 # ---------------------------------------------------------------------------
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 # ---------------------------------------------------------------------------
 # Platform-aware configuration
@@ -145,7 +148,7 @@ def _save_credentials(data: dict) -> None:
     lock_path = path.with_suffix(".lock")
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
     with open(lock_path, "w") as lf:
-        if sys.platform != "win32":
+        if fcntl is not None:
             fcntl.flock(lf, fcntl.LOCK_EX)  # exclusive lock
         try:
             with open(path, "wb") as f:
@@ -156,7 +159,7 @@ def _save_credentials(data: dict) -> None:
                 except OSError:
                     pass
         finally:
-            if sys.platform != "win32":
+            if fcntl is not None:
                 fcntl.flock(lf, fcntl.LOCK_UN)
 
 
