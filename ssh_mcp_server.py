@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # Version info
 # ---------------------------------------------------------------------------
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 # ---------------------------------------------------------------------------
 # Platform-aware configuration
@@ -829,7 +829,9 @@ async def ssh_execute(params: str) -> str:
     },
 )
 async def ssh_interactive(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, SSHInteractiveInput)
+    timing.mark("parse_params")
     """Open an interactive SSH shell session and send commands sequentially.
 
     Use this tool for devices that require interactive shell mode, such as:
@@ -840,6 +842,7 @@ async def ssh_interactive(params: str) -> str:
     Commands are sent one at a time, waiting for the prompt between them.
     """
     conn = params.resolve()
+    timing.mark("resolve_params")
 
     logger.info(
         "ssh_interactive: %s@%s:%d -> %d commands",
@@ -860,7 +863,9 @@ async def ssh_interactive(params: str) -> str:
         timeout=params.timeout,
         command_interval=params.command_interval,
     )
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    timing.mark("interactive_session")
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -874,13 +879,16 @@ async def ssh_interactive(params: str) -> str:
     },
 )
 async def ssh_file_read(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, SSHFileReadInput)
+    timing.mark("parse_params")
     """Read the contents of a file on a remote server via SSH.
 
     Useful for inspecting configuration files, logs, and other text files.
     Supports head/tail mode and line limits to avoid huge outputs.
     """
     conn = params.resolve()
+    timing.mark("resolve_params")
 
     if params.tail:
         cmd = f"tail -n {params.max_lines} {params.file_path}"
@@ -888,6 +896,7 @@ async def ssh_file_read(params: str) -> str:
         cmd = f"head -n {params.max_lines} {params.file_path}"
     else:
         cmd = f"cat {params.file_path}"
+    timing.mark("build_command")
 
     result = await asyncio.to_thread(
         _ssh_exec_command,
@@ -899,7 +908,9 @@ async def ssh_file_read(params: str) -> str:
         timeout=15,
         use_sudo=params.use_sudo,
     )
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    timing.mark("ssh_exec")
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -913,13 +924,16 @@ async def ssh_file_read(params: str) -> str:
     },
 )
 async def ssh_file_write(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, SSHFileWriteInput)
+    timing.mark("parse_params")
     """Write content to a file on a remote server via SSH.
 
     Uses SFTP for file transfer - no shell escaping or heredoc issues.
     Creates a .bak backup by default before overwriting.
     """
     conn = params.resolve()
+    timing.mark("resolve_params")
 
     # Backup existing file if requested
     if params.backup:
@@ -932,6 +946,7 @@ async def ssh_file_write(params: str) -> str:
             command=f"[ -f {params.file_path} ] && cp {params.file_path} {params.file_path}.bak",
             timeout=10,
         )
+        timing.mark("backup_existing")
 
     if params.use_sudo and conn["username"] != "root":
         # SFTP write to temp, then sudo move
@@ -945,8 +960,10 @@ async def ssh_file_write(params: str) -> str:
             remote_path=tmp_path,
             content=params.content,
         )
+        timing.mark("sftp_write_temp")
         if not write_result.get("success"):
-            return json.dumps(write_result, indent=2, ensure_ascii=False)
+            timing.mark("attach_timing")
+            return json.dumps(_attach_timing(write_result, timing), indent=2, ensure_ascii=False)
 
         # sudo move temp file to target
         move_result = await asyncio.to_thread(
@@ -958,9 +975,11 @@ async def ssh_file_write(params: str) -> str:
             command=f"sudo mv {tmp_path} {params.file_path}",
             timeout=10,
         )
+        timing.mark("sudo_move")
         if move_result["success"]:
             move_result["message"] = f"File written successfully: {params.file_path}"
-        return json.dumps(move_result, indent=2, ensure_ascii=False)
+        timing.mark("attach_timing")
+        return json.dumps(_attach_timing(move_result, timing), indent=2, ensure_ascii=False)
     else:
         # Direct SFTP write
         result = await asyncio.to_thread(
@@ -972,12 +991,14 @@ async def ssh_file_write(params: str) -> str:
             remote_path=params.file_path,
             content=params.content,
         )
+        timing.mark("sftp_write")
         if result.get("success"):
             result["exit_code"] = 0
             result["stdout"] = ""
             result["stderr"] = ""
             result["message"] = f"File written successfully: {params.file_path}"
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        timing.mark("attach_timing")
+        return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -1525,13 +1546,16 @@ async def ssh_linux_prepare_client_batch(params: str) -> str:
     },
 )
 async def ssh_credential_save(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, CredentialSaveInput)
+    timing.mark("parse_params")
     """Save SSH connection credentials to the local credential store.
 
     Saved credentials can be used by other ssh_* tools via the 'name' parameter,
     avoiding the need to pass host/username/password every time.
     """
     creds = _load_credentials()
+    timing.mark("load_credentials")
     creds["hosts"][params.name] = {
         "host": params.host,
         "port": params.port,
@@ -1541,27 +1565,27 @@ async def ssh_credential_save(params: str) -> str:
         "device_type": params.device_type,
     }
     _save_credentials(creds)
+    timing.mark("save_credentials")
     logger.info("Credential saved: %s -> %s@%s", params.name, params.username, params.host)
 
     host_list = _build_host_list(creds)
+    timing.mark("build_host_list")
 
-    return json.dumps(
-        {
-            "success": True,
-            "message": f"Credential '{params.name}' saved successfully.",
-            "changed_entry": {
-                "name": params.name,
-                "host": params.host,
-                "port": params.port,
-                "username": params.username,
-                "description": params.description,
-                "device_type": params.device_type,
-            },
-            "all_hosts": host_list,
+    result = {
+        "success": True,
+        "message": f"Credential '{params.name}' saved successfully.",
+        "changed_entry": {
+            "name": params.name,
+            "host": params.host,
+            "port": params.port,
+            "username": params.username,
+            "description": params.description,
+            "device_type": params.device_type,
         },
-        indent=2,
-        ensure_ascii=False,
-    )
+        "all_hosts": host_list,
+    }
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -1580,16 +1604,24 @@ async def ssh_credential_list() -> str:
     Shows host IDs, names, IPs, usernames, passwords, and descriptions.
     Use the numeric ID (e.g., "1", "2") or name to connect to a host.
     """
+    timing = _Timing()
     creds = _load_credentials()
     hosts = creds.get("hosts", {})
+    timing.mark("load_credentials")
 
     if not hosts:
+        timing.mark("attach_timing")
         return json.dumps(
-            {"success": True, "message": "No saved credentials.", "hosts": []},
+            _attach_timing(
+                {"success": True, "message": "No saved credentials.", "hosts": []},
+                timing,
+            ),
             indent=2,
+            ensure_ascii=False,
         )
 
     # 构建结构化的主机列表，包含所有字段（密码和类型也显示）
+    host_list = []
     host_list = []
     for idx, (name, info) in enumerate(hosts.items(), start=1):
         host_list.append({
@@ -1614,18 +1646,18 @@ async def ssh_credential_list() -> str:
         )
         lines.append(row)
     markdown_table = "\n".join(lines)
+    timing.mark("build_host_list")
+
+    result = {
+        "success": True,
+        "message": f"Found {len(host_list)} saved credential(s).",
+        "table": markdown_table,
+        "all_hosts": host_list,
+    }
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
     # 返回 JSON，包含 Markdown 表格和原始数据，确保所有字段完整显示
-    return json.dumps(
-        {
-            "success": True,
-            "message": f"Found {len(host_list)} saved credential(s).",
-            "table": markdown_table,
-            "all_hosts": host_list,
-        },
-        indent=2,
-        ensure_ascii=False,
-    )
 
 
 @mcp.tool(
@@ -1639,41 +1671,46 @@ async def ssh_credential_list() -> str:
     },
 )
 async def ssh_credential_delete(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, CredentialDeleteInput)
+    timing.mark("parse_params")
     """Delete a saved SSH credential from the local credential store."""
     creds = _load_credentials()
+    timing.mark("load_credentials")
     if params.name not in creds.get("hosts", {}):
+        timing.mark("attach_timing")
         return json.dumps(
-            {
+            _attach_timing({
                 "success": False,
                 "error": f"Credential '{params.name}' not found.",
-            },
+            }, timing),
             indent=2,
+            ensure_ascii=False,
         )
 
     # Get info before deletion
     deleted_info = creds["hosts"][params.name]
     del creds["hosts"][params.name]
     _save_credentials(creds)
+    timing.mark("save_credentials")
     logger.info("Credential deleted: %s", params.name)
 
     host_list = _build_host_list(creds)
+    timing.mark("build_host_list")
 
-    return json.dumps(
-        {
-            "success": True,
-            "message": f"Credential '{params.name}' deleted.",
-            "changed_entry": {
-                "action": "deleted",
-                "name": params.name,
-                "host": deleted_info.get("host", ""),
-                "username": deleted_info.get("username", ""),
-            },
-            "all_hosts": host_list,
+    result = {
+        "success": True,
+        "message": f"Credential '{params.name}' deleted.",
+        "changed_entry": {
+            "action": "deleted",
+            "name": params.name,
+            "host": deleted_info.get("host", ""),
+            "username": deleted_info.get("username", ""),
         },
-        indent=2,
-        ensure_ascii=False,
-    )
+        "all_hosts": host_list,
+    }
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -1687,17 +1724,25 @@ async def ssh_credential_delete(params: str) -> str:
     },
 )
 async def ssh_credential_update(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, CredentialUpdateInput)
+    timing.mark("parse_params")
     """Update an existing SSH credential. Only provided fields will be updated.
 
     Use this tool to modify specific attributes of a saved credential without
     re-specifying all fields. Unspecified fields retain their current values.
     """
     creds = _load_credentials()
+    timing.mark("load_credentials")
     if params.name not in creds.get("hosts", {}):
+        timing.mark("attach_timing")
         return json.dumps(
-            {"success": False, "error": f"Credential '{params.name}' not found."},
+            _attach_timing(
+                {"success": False, "error": f"Credential '{params.name}' not found."},
+                timing,
+            ),
             indent=2,
+            ensure_ascii=False,
         )
 
     host_info = creds["hosts"][params.name]
@@ -1726,31 +1771,32 @@ async def ssh_credential_update(params: str) -> str:
         old = host_info.get("device_type", "linux")
         host_info["device_type"] = params.device_type
         changes.append(f"device_type: {old} -> {params.device_type}")
+    timing.mark("apply_changes")
 
     _save_credentials(creds)
+    timing.mark("save_credentials")
     logger.info("Credential updated: %s, changes: %s", params.name, changes)
 
     host_list = _build_host_list(creds)
+    timing.mark("build_host_list")
 
-    return json.dumps(
-        {
-            "success": True,
-            "message": f"Credential '{params.name}' updated.",
-            "changes": changes,
-            "changed_entry": {
-                "action": "updated",
-                "name": params.name,
-                "host": host_info["host"],
-                "port": host_info["port"],
-                "username": host_info["username"],
-                "description": host_info.get("description", ""),
-                "device_type": host_info.get("device_type", "linux"),
-            },
-            "all_hosts": host_list,
+    result = {
+        "success": True,
+        "message": f"Credential '{params.name}' updated.",
+        "changes": changes,
+        "changed_entry": {
+            "action": "updated",
+            "name": params.name,
+            "host": host_info["host"],
+            "port": host_info["port"],
+            "username": host_info["username"],
+            "description": host_info.get("description", ""),
+            "device_type": host_info.get("device_type", "linux"),
         },
-        indent=2,
-        ensure_ascii=False,
-    )
+        "all_hosts": host_list,
+    }
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1795,6 +1841,7 @@ async def ssh_mcp_version() -> str:
             "ssh_linux_prepare_client",
             "ssh_linux_prepare_client_batch",
             "timing",
+            "timing_all_tools",
         ],
     }
     timing.mark("gather_info")
