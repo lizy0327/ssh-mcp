@@ -22,7 +22,9 @@ import os
 import platform
 import re
 import sys
+import fcntl
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -34,7 +36,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # Version info
 # ---------------------------------------------------------------------------
 
-__version__ = "2.0.0"
+__version__ = "2.2.0"
 
 # ---------------------------------------------------------------------------
 # Platform-aware configuration
@@ -137,18 +139,25 @@ def _load_credentials() -> dict:
 
 
 def _save_credentials(data: dict) -> None:
-    """Save credentials to JSON file with restricted permissions (POSIX only)."""
+    """Save credentials with exclusive file lock (prevents concurrent write corruption)."""
     path = Path(CREDENTIALS_FILE)
-    # Ensure parent directory exists (important for Windows %APPDATA%\ssh-mcp\)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    # chmod only works on POSIX; silently skip on Windows
-    if sys.platform != "win32":
+    lock_path = path.with_suffix(".lock")
+    payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    with open(lock_path, "w") as lf:
+        if sys.platform != "win32":
+            fcntl.flock(lf, fcntl.LOCK_EX)  # exclusive lock
         try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+            with open(path, "wb") as f:
+                f.write(payload)
+            if sys.platform != "win32":
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+        finally:
+            if sys.platform != "win32":
+                fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def _build_host_list(creds: dict) -> list:
@@ -292,7 +301,7 @@ def _ssh_sftp_upload_and_run(
     use_sudo: bool = False,
 ) -> dict:
     """Upload a script via SFTP and execute it. No heredoc issues."""
-    tmp_script = f"/tmp/.ssh_mcp_script_{int(time.time())}_{os.getpid()}.sh"
+    tmp_script = f"/tmp/.ssh_mcp_{uuid.uuid4().hex[:16]}.sh"
     client = None
     try:
         client = _ssh_connect(host, port, username, password)
@@ -465,6 +474,19 @@ def _ssh_interactive_session(
     finally:
         client.close()
 
+
+
+
+def _parse_tool_params(params, model_cls):
+    """Accept Codex/mcp-remote params as JSON string or dict, then validate."""
+    if isinstance(params, model_cls):
+        return params
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON params for {model_cls.__name__}: {exc}") from exc
+    return model_cls.model_validate(params)
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -703,7 +725,8 @@ class CredentialUpdateInput(BaseModel):
         "openWorldHint": True,
     },
 )
-async def ssh_execute(params: SSHExecuteInput) -> str:
+async def ssh_execute(params: str) -> str:
+    params = _parse_tool_params(params, SSHExecuteInput)
     """Execute a shell command on a remote Linux server via SSH.
 
     Use this tool for running diagnostics (systemctl, journalctl, df, top, etc.),
@@ -755,7 +778,8 @@ async def ssh_execute(params: SSHExecuteInput) -> str:
         "openWorldHint": True,
     },
 )
-async def ssh_interactive(params: SSHInteractiveInput) -> str:
+async def ssh_interactive(params: str) -> str:
+    params = _parse_tool_params(params, SSHInteractiveInput)
     """Open an interactive SSH shell session and send commands sequentially.
 
     Use this tool for devices that require interactive shell mode, such as:
@@ -799,7 +823,8 @@ async def ssh_interactive(params: SSHInteractiveInput) -> str:
         "openWorldHint": True,
     },
 )
-async def ssh_file_read(params: SSHFileReadInput) -> str:
+async def ssh_file_read(params: str) -> str:
+    params = _parse_tool_params(params, SSHFileReadInput)
     """Read the contents of a file on a remote server via SSH.
 
     Useful for inspecting configuration files, logs, and other text files.
@@ -837,7 +862,8 @@ async def ssh_file_read(params: SSHFileReadInput) -> str:
         "openWorldHint": True,
     },
 )
-async def ssh_file_write(params: SSHFileWriteInput) -> str:
+async def ssh_file_write(params: str) -> str:
+    params = _parse_tool_params(params, SSHFileWriteInput)
     """Write content to a file on a remote server via SSH.
 
     Uses SFTP for file transfer - no shell escaping or heredoc issues.
@@ -914,7 +940,8 @@ async def ssh_file_write(params: SSHFileWriteInput) -> str:
         "openWorldHint": True,
     },
 )
-async def ssh_script(params: SSHScriptInput) -> str:
+async def ssh_script(params: str) -> str:
+    params = _parse_tool_params(params, SSHScriptInput)
     """Upload and execute a script on a remote server.
 
     Uses SFTP for script upload - no heredoc or shell escaping issues.
@@ -947,6 +974,434 @@ async def ssh_script(params: SSHScriptInput) -> str:
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+
+# ---------------------------------------------------------------------------
+# Batch execution models & tools  (parallel: ssh_execute_batch / ssh_script_batch)
+# ---------------------------------------------------------------------------
+
+class SSHBatchHostEntry(BaseModel):
+    """Single host entry for batch tools."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: Optional[str] = Field(default=None,
+        description="Saved credential name or ID (e.g. 'client105'). Use instead of host/username/password.")
+    host: Optional[str] = Field(default=None, description="Target IP or hostname.")
+    port: int = Field(default=22, ge=1, le=65535)
+    username: Optional[str] = Field(default=None)
+    password: Optional[str] = Field(default=None)
+    command: Optional[str] = Field(default=None,
+        description="Per-host command override (ssh_execute_batch only).")
+    script_content: Optional[str] = Field(default=None,
+        description="Per-host script override (ssh_script_batch only).")
+
+    def resolve(self) -> dict:
+        if self.name:
+            resolved = _resolve_host(self.name)
+            if resolved is None:
+                raise ValueError(f"Credential \'{self.name}\' not found.")
+            return resolved
+        if not self.host or not self.username:
+            raise ValueError("Either name or host+username+password required.")
+        return {"host": self.host, "port": self.port,
+                "username": self.username, "password": self.password or ""}
+
+
+class SSHBatchExecuteInput(BaseModel):
+    """Input for ssh_execute_batch."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    hosts: list[SSHBatchHostEntry] = Field(..., min_length=1,
+        description="Target host list. Each entry may override the top-level command.")
+    command: Optional[str] = Field(default=None,
+        description="Default command for all hosts; per-host entry overrides.")
+    timeout: int = Field(default=60, ge=5, le=3600)
+    use_sudo: bool = Field(default=False)
+    cwd: Optional[str] = Field(default=None)
+    max_concurrency: int = Field(default=20, ge=1, le=50,
+        description="Max simultaneous SSH connections. Prevents gateway resource exhaustion.")
+
+
+class SSHBatchScriptInput(BaseModel):
+    """Input for ssh_script_batch."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    hosts: list[SSHBatchHostEntry] = Field(..., min_length=1,
+        description="Target host list. Each entry may override top-level script_content.")
+    script_content: Optional[str] = Field(default=None,
+        description="Default script to run on all hosts.")
+    interpreter: str = Field(default="/bin/bash")
+    timeout: int = Field(default=600, ge=5, le=3600)
+    use_sudo: bool = Field(default=False)
+    max_concurrency: int = Field(default=20, ge=1, le=50)
+
+
+@mcp.tool(
+    name="ssh_execute_batch",
+    annotations={
+        "title": "Batch Execute SSH Command (Parallel)",
+        "readOnlyHint": False, "destructiveHint": True,
+        "idempotentHint": False, "openWorldHint": True,
+    },
+)
+async def ssh_execute_batch(params: str) -> str:
+    params = _parse_tool_params(params, SSHBatchExecuteInput)
+    """Execute a command on multiple hosts in TRUE PARALLEL using asyncio.gather.
+
+    Total elapsed time = slowest single host (not sum of all).
+    Use this instead of calling ssh_execute N times when initializing N hosts.
+    max_concurrency caps simultaneous SSH connections to protect gateway resources.
+    """
+    sem = asyncio.Semaphore(params.max_concurrency)
+
+    async def _run_one(entry: SSHBatchHostEntry) -> dict:
+        cmd   = entry.command or params.command
+        label = entry.name or entry.host or "unknown"
+        if not cmd:
+            return {"host": label, "name": entry.name,
+                    "success": False, "error": "No command specified."}
+        try:
+            conn = entry.resolve()
+        except ValueError as e:
+            return {"host": label, "name": entry.name, "success": False, "error": str(e)}
+        if params.cwd:
+            cmd = f"cd {params.cwd} && {cmd}"
+        block = _check_blocked(cmd)
+        if block:
+            return {"host": conn["host"], "name": entry.name, "success": False, "error": block}
+        async with sem:
+            result = await asyncio.to_thread(
+                _ssh_exec_command,
+                host=conn["host"], port=conn["port"],
+                username=conn["username"], password=conn["password"],
+                command=cmd, timeout=params.timeout, use_sudo=params.use_sudo,
+            )
+        result["host"] = conn["host"]
+        result["name"] = entry.name
+        return result
+
+    start_ts = time.time()
+    results  = await asyncio.gather(*[_run_one(h) for h in params.hosts])
+    elapsed  = round(time.time() - start_ts, 2)
+    total    = len(results)
+    success  = sum(1 for r in results if r.get("success"))
+    logger.info("ssh_execute_batch: %d hosts, %d ok, %d failed, %.1fs",
+                total, success, total - success, elapsed)
+    return json.dumps({
+        "summary": {"total": total, "success": success,
+                    "failed": total - success, "elapsed_seconds": elapsed},
+        "results": list(results),
+    }, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="ssh_script_batch",
+    annotations={
+        "title": "Batch Execute Script (Parallel)",
+        "readOnlyHint": False, "destructiveHint": True,
+        "idempotentHint": False, "openWorldHint": True,
+    },
+)
+async def ssh_script_batch(params: str) -> str:
+    params = _parse_tool_params(params, SSHBatchScriptInput)
+    """Upload and execute a script on multiple hosts in TRUE PARALLEL.
+
+    Total elapsed time = slowest single host (not sum of all).
+    Scripts are uploaded via SFTP (no heredoc issues) and cleaned up after execution.
+    """
+    sem = asyncio.Semaphore(params.max_concurrency)
+
+    async def _run_one(entry: SSHBatchHostEntry) -> dict:
+        script = entry.script_content or params.script_content
+        label  = entry.name or entry.host or "unknown"
+        if not script:
+            return {"host": label, "name": entry.name,
+                    "success": False, "error": "No script_content specified."}
+        try:
+            conn = entry.resolve()
+        except ValueError as e:
+            return {"host": label, "name": entry.name, "success": False, "error": str(e)}
+        async with sem:
+            result = await asyncio.to_thread(
+                _ssh_sftp_upload_and_run,
+                host=conn["host"], port=conn["port"],
+                username=conn["username"], password=conn["password"],
+                script_content=script, interpreter=params.interpreter,
+                timeout=params.timeout, use_sudo=params.use_sudo,
+            )
+        result["host"] = conn["host"]
+        result["name"] = entry.name
+        return result
+
+    start_ts = time.time()
+    results  = await asyncio.gather(*[_run_one(h) for h in params.hosts])
+    elapsed  = round(time.time() - start_ts, 2)
+    total    = len(results)
+    success  = sum(1 for r in results if r.get("success"))
+    logger.info("ssh_script_batch: %d hosts, %d ok, %d failed, %.1fs",
+                total, success, total - success, elapsed)
+    return json.dumps({
+        "summary": {"total": total, "success": success,
+                    "failed": total - success, "elapsed_seconds": elapsed},
+        "results": list(results),
+    }, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Linux client preparation tools
+# ---------------------------------------------------------------------------
+
+class LinuxPrepareClientInput(SSHTarget):
+    """Input for preparing one Linux client for faster initialization."""
+
+    force_dnf_cleanup: bool = Field(
+        default=True,
+        description="Kill stale dnf processes and remove stale yum/dnf lock files.",
+    )
+    dnf_parallel_downloads: int = Field(
+        default=10,
+        ge=1,
+        le=20,
+        description="Value for /etc/dnf/dnf.conf max_parallel_downloads.",
+    )
+    configure_chrony: bool = Field(
+        default=True,
+        description="Ensure chrony uses makestep 1.0 -1 for large clock offsets.",
+    )
+    run_chrony_makestep: bool = Field(
+        default=True,
+        description="Run chronyc makestep immediately after chrony configuration.",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="Print planned actions without changing the target host.",
+    )
+    timeout: int = Field(default=180, ge=5, le=1800)
+
+
+class LinuxPrepareClientBatchInput(BaseModel):
+    """Input for preparing multiple Linux clients in parallel."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    hosts: list[SSHBatchHostEntry] = Field(..., min_length=1)
+    force_dnf_cleanup: bool = Field(default=True)
+    dnf_parallel_downloads: int = Field(default=10, ge=1, le=20)
+    configure_chrony: bool = Field(default=True)
+    run_chrony_makestep: bool = Field(default=True)
+    dry_run: bool = Field(default=False)
+    timeout: int = Field(default=180, ge=5, le=1800)
+    max_concurrency: int = Field(default=20, ge=1, le=50)
+
+
+def _build_linux_prepare_script(
+    *,
+    force_dnf_cleanup: bool = True,
+    dnf_parallel_downloads: int = 10,
+    configure_chrony: bool = True,
+    run_chrony_makestep: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Build an idempotent script that runs on a target Linux client."""
+    return f"""#!/bin/bash
+set -u
+
+DRY_RUN={str(dry_run).lower()}
+FORCE_DNF_CLEANUP={str(force_dnf_cleanup).lower()}
+DNF_PARALLEL_DOWNLOADS={int(dnf_parallel_downloads)}
+CONFIGURE_CHRONY={str(configure_chrony).lower()}
+RUN_CHRONY_MAKESTEP={str(run_chrony_makestep).lower()}
+
+log() {{ printf '[linux_prepare] %s\\n' "$*"; }}
+
+run() {{
+  if [ "$DRY_RUN" = "true" ]; then
+    printf '[dry-run] %s\\n' "$*"
+  else
+    eval "$@"
+  fi
+}}
+
+ensure_root() {{
+  if [ "$(id -u)" -ne 0 ]; then
+    log "ERROR: this preparation requires root privileges"
+    exit 1
+  fi
+}}
+
+set_key_value() {{
+  local file="$1" key="$2" value="$3"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "Would ensure $file has $key=$value"
+    return 0
+  fi
+  touch "$file"
+  if grep -qE "^${{key}}=" "$file"; then
+    sed -i "s/^${{key}}=.*/${{key}}=${{value}}/" "$file"
+  else
+    printf '\\n%s=%s\\n' "$key" "$value" >> "$file"
+  fi
+}}
+
+ensure_line() {{
+  local file="$1" line="$2"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "Would ensure $file contains: $line"
+    return 0
+  fi
+  touch "$file"
+  grep -qxF "$line" "$file" || printf '\\n%s\\n' "$line" >> "$file"
+}}
+
+ensure_root
+log "host=$(hostname) dry_run=$DRY_RUN"
+
+if [ "$FORCE_DNF_CLEANUP" = "true" ]; then
+  log "Cleaning stale DNF/YUM locks before repo/package operations"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "Would kill dnf processes and remove yum/dnf lock files"
+  else
+    pkill -9 dnf 2>/dev/null || true
+    sleep 1
+    rm -f /var/run/yum.pid /var/cache/dnf/download_lock.pid 2>/dev/null || true
+  fi
+fi
+
+if command -v dnf >/dev/null 2>&1; then
+  log "Setting DNF max_parallel_downloads=$DNF_PARALLEL_DOWNLOADS"
+  set_key_value /etc/dnf/dnf.conf max_parallel_downloads "$DNF_PARALLEL_DOWNLOADS"
+else
+  log "DNF not found; skipping max_parallel_downloads"
+fi
+
+if [ "$CONFIGURE_CHRONY" = "true" ]; then
+  if [ -f /etc/chrony.conf ] || command -v chronyd >/dev/null 2>&1 || command -v chronyc >/dev/null 2>&1; then
+    log "Ensuring chrony makestep for large clock offsets"
+    ensure_line /etc/chrony.conf "makestep 1.0 -1"
+    if [ "$DRY_RUN" != "true" ]; then
+      systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
+    fi
+  else
+    log "chrony not found; skipping chrony configuration"
+  fi
+fi
+
+if [ "$RUN_CHRONY_MAKESTEP" = "true" ]; then
+  if command -v chronyc >/dev/null 2>&1; then
+    log "Running chronyc makestep"
+    run "chronyc makestep || true"
+  else
+    log "chronyc not found; skipping immediate makestep"
+  fi
+fi
+
+log "Final DNF setting:"
+grep -n '^max_parallel_downloads=' /etc/dnf/dnf.conf 2>/dev/null || true
+log "Final chrony makestep setting:"
+grep -n '^makestep 1.0 -1$' /etc/chrony.conf 2>/dev/null || true
+log "Remaining DNF lock files/processes:"
+ls -l /var/run/yum.pid /var/cache/dnf/download_lock.pid 2>/dev/null || true
+pgrep -a dnf 2>/dev/null || true
+log "complete"
+"""
+
+
+def _linux_prepare_options_from_input(params) -> dict:
+    return {
+        "force_dnf_cleanup": params.force_dnf_cleanup,
+        "dnf_parallel_downloads": params.dnf_parallel_downloads,
+        "configure_chrony": params.configure_chrony,
+        "run_chrony_makestep": params.run_chrony_makestep,
+        "dry_run": params.dry_run,
+    }
+
+
+@mcp.tool(
+    name="ssh_linux_prepare_client",
+    annotations={
+        "title": "Prepare Linux Client",
+        "readOnlyHint": False, "destructiveHint": True,
+        "idempotentHint": True, "openWorldHint": True,
+    },
+)
+async def ssh_linux_prepare_client(params: str) -> str:
+    """Prepare one Linux client for faster, more reliable initialization."""
+    params = _parse_tool_params(params, LinuxPrepareClientInput)
+    conn = params.resolve()
+    script = _build_linux_prepare_script(**_linux_prepare_options_from_input(params))
+    logger.info("ssh_linux_prepare_client: %s@%s:%d dry_run=%s",
+                conn["username"], conn["host"], conn["port"], params.dry_run)
+    result = await asyncio.to_thread(
+        _ssh_sftp_upload_and_run,
+        host=conn["host"], port=conn["port"],
+        username=conn["username"], password=conn["password"],
+        script_content=script, interpreter="/bin/bash",
+        timeout=params.timeout, use_sudo=False,
+    )
+    result["host"] = conn["host"]
+    result["name"] = params.name
+    result["dry_run"] = params.dry_run
+    result["optimizations"] = {
+        "dnf_lock_cleanup": params.force_dnf_cleanup,
+        "dnf_parallel_downloads": params.dnf_parallel_downloads,
+        "chrony_makestep_config": params.configure_chrony,
+        "chronyc_makestep_now": params.run_chrony_makestep,
+    }
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="ssh_linux_prepare_client_batch",
+    annotations={
+        "title": "Prepare Linux Clients (Parallel)",
+        "readOnlyHint": False, "destructiveHint": True,
+        "idempotentHint": True, "openWorldHint": True,
+    },
+)
+async def ssh_linux_prepare_client_batch(params: str) -> str:
+    """Prepare multiple Linux clients in parallel. Use dry_run=true first."""
+    params = _parse_tool_params(params, LinuxPrepareClientBatchInput)
+    script = _build_linux_prepare_script(**_linux_prepare_options_from_input(params))
+    sem = asyncio.Semaphore(params.max_concurrency)
+
+    async def _run_one(entry: SSHBatchHostEntry) -> dict:
+        label = entry.name or entry.host or "unknown"
+        try:
+            conn = entry.resolve()
+        except ValueError as e:
+            return {"host": label, "name": entry.name, "success": False, "error": str(e)}
+        async with sem:
+            result = await asyncio.to_thread(
+                _ssh_sftp_upload_and_run,
+                host=conn["host"], port=conn["port"],
+                username=conn["username"], password=conn["password"],
+                script_content=script, interpreter="/bin/bash",
+                timeout=params.timeout, use_sudo=False,
+            )
+        result["host"] = conn["host"]
+        result["name"] = entry.name
+        result["dry_run"] = params.dry_run
+        return result
+
+    start_ts = time.time()
+    results = await asyncio.gather(*[_run_one(h) for h in params.hosts])
+    elapsed = round(time.time() - start_ts, 2)
+    total = len(results)
+    success = sum(1 for r in results if r.get("success"))
+    logger.info("ssh_linux_prepare_client_batch: %d hosts, %d ok, %d failed, %.1fs",
+                total, success, total - success, elapsed)
+    return json.dumps({
+        "summary": {
+            "total": total, "success": success,
+            "failed": total - success, "elapsed_seconds": elapsed,
+            "dry_run": params.dry_run,
+            "optimizations": {
+                "dnf_lock_cleanup": params.force_dnf_cleanup,
+                "dnf_parallel_downloads": params.dnf_parallel_downloads,
+                "chrony_makestep_config": params.configure_chrony,
+                "chronyc_makestep_now": params.run_chrony_makestep,
+            },
+        },
+        "results": list(results),
+    }, indent=2, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Credential management tools
 # ---------------------------------------------------------------------------
@@ -962,7 +1417,8 @@ async def ssh_script(params: SSHScriptInput) -> str:
         "openWorldHint": False,
     },
 )
-async def ssh_credential_save(params: CredentialSaveInput) -> str:
+async def ssh_credential_save(params: str) -> str:
+    params = _parse_tool_params(params, CredentialSaveInput)
     """Save SSH connection credentials to the local credential store.
 
     Saved credentials can be used by other ssh_* tools via the 'name' parameter,
@@ -1075,7 +1531,8 @@ async def ssh_credential_list() -> str:
         "openWorldHint": False,
     },
 )
-async def ssh_credential_delete(params: CredentialDeleteInput) -> str:
+async def ssh_credential_delete(params: str) -> str:
+    params = _parse_tool_params(params, CredentialDeleteInput)
     """Delete a saved SSH credential from the local credential store."""
     creds = _load_credentials()
     if params.name not in creds.get("hosts", {}):
@@ -1122,7 +1579,8 @@ async def ssh_credential_delete(params: CredentialDeleteInput) -> str:
         "openWorldHint": False,
     },
 )
-async def ssh_credential_update(params: CredentialUpdateInput) -> str:
+async def ssh_credential_update(params: str) -> str:
+    params = _parse_tool_params(params, CredentialUpdateInput)
     """Update an existing SSH credential. Only provided fields will be updated.
 
     Use this tool to modify specific attributes of a saved credential without
@@ -1221,6 +1679,14 @@ async def ssh_mcp_version() -> str:
         "credentials_file": CREDENTIALS_FILE,
         "credentials_exists": Path(CREDENTIALS_FILE).exists(),
         "hostname": platform.node(),
+        "features": [
+            "ssh_execute",
+            "ssh_script",
+            "ssh_execute_batch",
+            "ssh_script_batch",
+            "ssh_linux_prepare_client",
+            "ssh_linux_prepare_client_batch",
+        ],
     }
     return json.dumps(info, indent=2, ensure_ascii=False)
 
