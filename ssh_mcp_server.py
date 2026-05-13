@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # Version info
 # ---------------------------------------------------------------------------
 
-__version__ = "2.2.1"
+__version__ = "2.3.0"
 
 # ---------------------------------------------------------------------------
 # Platform-aware configuration
@@ -118,6 +118,42 @@ _RUNTIME_INFO = {
     "host": None,
     "port": None,
 }
+
+_ENABLE_TIMING = os.environ.get("SSH_MCP_TIMING", "1") != "0"
+_ENABLE_TIMING_DETAIL = os.environ.get("SSH_MCP_TIMING_DETAIL", "1") != "0"
+
+
+class _Timing:
+    __slots__ = ("_enabled", "_t0", "_last", "_steps")
+
+    def __init__(self, enabled: bool = _ENABLE_TIMING):
+        self._enabled = enabled
+        self._t0 = time.monotonic()
+        self._last = self._t0
+        self._steps = {}
+
+    def mark(self, step: str) -> None:
+        if not self._enabled:
+            return
+        now = time.monotonic()
+        self._steps[step] = round((now - self._last) * 1000, 3)
+        self._last = now
+
+    def as_dict(self) -> Optional[dict]:
+        if not self._enabled:
+            return None
+        now = time.monotonic()
+        return {
+            "total_ms": round((now - self._t0) * 1000, 3),
+            "steps": self._steps,
+        }
+
+
+def _attach_timing(result: dict, timing: _Timing) -> dict:
+    timing_data = timing.as_dict()
+    if timing_data is not None:
+        result["_timing"] = timing_data
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +765,9 @@ class CredentialUpdateInput(BaseModel):
     },
 )
 async def ssh_execute(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, SSHExecuteInput)
+    timing.mark("parse_params")
     """Execute a shell command on a remote Linux server via SSH.
 
     Use this tool for running diagnostics (systemctl, journalctl, df, top, etc.),
@@ -740,11 +778,18 @@ async def ssh_execute(params: str) -> str:
     """
     conn = params.resolve()
     command = params.command
+    timing.mark("resolve_params")
 
     # Safety check
     block_reason = _check_blocked(command)
+    timing.mark("safety_check")
     if block_reason:
-        return json.dumps({"success": False, "error": block_reason}, indent=2)
+        timing.mark("attach_timing")
+        return json.dumps(
+            _attach_timing({"success": False, "error": block_reason}, timing),
+            indent=2,
+            ensure_ascii=False,
+        )
 
     # Prepend cd if cwd specified
     if params.cwd:
@@ -768,7 +813,9 @@ async def ssh_execute(params: str) -> str:
         timeout=params.timeout,
         use_sudo=params.use_sudo,
     )
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    timing.mark("ssh_exec")
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -944,7 +991,9 @@ async def ssh_file_write(params: str) -> str:
     },
 )
 async def ssh_script(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, SSHScriptInput)
+    timing.mark("parse_params")
     """Upload and execute a script on a remote server.
 
     Uses SFTP for script upload - no heredoc or shell escaping issues.
@@ -954,6 +1003,7 @@ async def ssh_script(params: str) -> str:
     The script is uploaded to /tmp, executed, and then cleaned up.
     """
     conn = params.resolve()
+    timing.mark("resolve_params")
 
     logger.info(
         "ssh_script: %s@%s:%d -> upload and run script (%d bytes)",
@@ -974,7 +1024,9 @@ async def ssh_script(params: str) -> str:
         timeout=params.timeout,
         use_sudo=params.use_sudo,
     )
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    timing.mark("script_upload_exec_total")
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 
@@ -1044,7 +1096,9 @@ class SSHBatchScriptInput(BaseModel):
     },
 )
 async def ssh_execute_batch(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, SSHBatchExecuteInput)
+    timing.mark("parse_params")
     """Execute a command on multiple hosts in TRUE PARALLEL using asyncio.gather.
 
     Total elapsed time = slowest single host (not sum of all).
@@ -1054,20 +1108,32 @@ async def ssh_execute_batch(params: str) -> str:
     sem = asyncio.Semaphore(params.max_concurrency)
 
     async def _run_one(entry: SSHBatchHostEntry) -> dict:
+        host_timing = _Timing(_ENABLE_TIMING and _ENABLE_TIMING_DETAIL)
         cmd   = entry.command or params.command
         label = entry.name or entry.host or "unknown"
         if not cmd:
-            return {"host": label, "name": entry.name,
-                    "success": False, "error": "No command specified."}
+            return _attach_timing(
+                {"host": label, "name": entry.name,
+                 "success": False, "error": "No command specified."},
+                host_timing,
+            )
         try:
             conn = entry.resolve()
+            host_timing.mark("resolve")
         except ValueError as e:
-            return {"host": label, "name": entry.name, "success": False, "error": str(e)}
+            host_timing.mark("resolve")
+            return _attach_timing(
+                {"host": label, "name": entry.name, "success": False, "error": str(e)},
+                host_timing,
+            )
         if params.cwd:
             cmd = f"cd {params.cwd} && {cmd}"
         block = _check_blocked(cmd)
         if block:
-            return {"host": conn["host"], "name": entry.name, "success": False, "error": block}
+            return _attach_timing(
+                {"host": conn["host"], "name": entry.name, "success": False, "error": block},
+                host_timing,
+            )
         async with sem:
             result = await asyncio.to_thread(
                 _ssh_exec_command,
@@ -1075,22 +1141,26 @@ async def ssh_execute_batch(params: str) -> str:
                 username=conn["username"], password=conn["password"],
                 command=cmd, timeout=params.timeout, use_sudo=params.use_sudo,
             )
+        host_timing.mark("ssh_exec")
         result["host"] = conn["host"]
         result["name"] = entry.name
-        return result
+        return _attach_timing(result, host_timing)
 
     start_ts = time.time()
     results  = await asyncio.gather(*[_run_one(h) for h in params.hosts])
+    timing.mark("batch_gather")
     elapsed  = round(time.time() - start_ts, 2)
     total    = len(results)
     success  = sum(1 for r in results if r.get("success"))
     logger.info("ssh_execute_batch: %d hosts, %d ok, %d failed, %.1fs",
                 total, success, total - success, elapsed)
-    return json.dumps({
+    response = {
         "summary": {"total": total, "success": success,
                     "failed": total - success, "elapsed_seconds": elapsed},
         "results": list(results),
-    }, indent=2, ensure_ascii=False)
+    }
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(response, timing), indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -1102,7 +1172,9 @@ async def ssh_execute_batch(params: str) -> str:
     },
 )
 async def ssh_script_batch(params: str) -> str:
+    timing = _Timing()
     params = _parse_tool_params(params, SSHBatchScriptInput)
+    timing.mark("parse_params")
     """Upload and execute a script on multiple hosts in TRUE PARALLEL.
 
     Total elapsed time = slowest single host (not sum of all).
@@ -1111,15 +1183,24 @@ async def ssh_script_batch(params: str) -> str:
     sem = asyncio.Semaphore(params.max_concurrency)
 
     async def _run_one(entry: SSHBatchHostEntry) -> dict:
+        host_timing = _Timing(_ENABLE_TIMING and _ENABLE_TIMING_DETAIL)
         script = entry.script_content or params.script_content
         label  = entry.name or entry.host or "unknown"
         if not script:
-            return {"host": label, "name": entry.name,
-                    "success": False, "error": "No script_content specified."}
+            return _attach_timing(
+                {"host": label, "name": entry.name,
+                 "success": False, "error": "No script_content specified."},
+                host_timing,
+            )
         try:
             conn = entry.resolve()
+            host_timing.mark("resolve")
         except ValueError as e:
-            return {"host": label, "name": entry.name, "success": False, "error": str(e)}
+            host_timing.mark("resolve")
+            return _attach_timing(
+                {"host": label, "name": entry.name, "success": False, "error": str(e)},
+                host_timing,
+            )
         async with sem:
             result = await asyncio.to_thread(
                 _ssh_sftp_upload_and_run,
@@ -1128,22 +1209,26 @@ async def ssh_script_batch(params: str) -> str:
                 script_content=script, interpreter=params.interpreter,
                 timeout=params.timeout, use_sudo=params.use_sudo,
             )
+        host_timing.mark("script_upload_exec_total")
         result["host"] = conn["host"]
         result["name"] = entry.name
-        return result
+        return _attach_timing(result, host_timing)
 
     start_ts = time.time()
     results  = await asyncio.gather(*[_run_one(h) for h in params.hosts])
+    timing.mark("batch_gather")
     elapsed  = round(time.time() - start_ts, 2)
     total    = len(results)
     success  = sum(1 for r in results if r.get("success"))
     logger.info("ssh_script_batch: %d hosts, %d ok, %d failed, %.1fs",
                 total, success, total - success, elapsed)
-    return json.dumps({
+    response = {
         "summary": {"total": total, "success": success,
                     "failed": total - success, "elapsed_seconds": elapsed},
         "results": list(results),
-    }, indent=2, ensure_ascii=False)
+    }
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(response, timing), indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1325,9 +1410,13 @@ def _linux_prepare_options_from_input(params) -> dict:
 )
 async def ssh_linux_prepare_client(params: str) -> str:
     """Prepare one Linux client for faster, more reliable initialization."""
+    timing = _Timing()
     params = _parse_tool_params(params, LinuxPrepareClientInput)
+    timing.mark("parse_params")
     conn = params.resolve()
+    timing.mark("resolve_params")
     script = _build_linux_prepare_script(**_linux_prepare_options_from_input(params))
+    timing.mark("build_script")
     logger.info("ssh_linux_prepare_client: %s@%s:%d dry_run=%s",
                 conn["username"], conn["host"], conn["port"], params.dry_run)
     result = await asyncio.to_thread(
@@ -1337,6 +1426,7 @@ async def ssh_linux_prepare_client(params: str) -> str:
         script_content=script, interpreter="/bin/bash",
         timeout=params.timeout, use_sudo=False,
     )
+    timing.mark("script_upload_exec_total")
     result["host"] = conn["host"]
     result["name"] = params.name
     result["dry_run"] = params.dry_run
@@ -1346,7 +1436,8 @@ async def ssh_linux_prepare_client(params: str) -> str:
         "chrony_makestep_config": params.configure_chrony,
         "chronyc_makestep_now": params.run_chrony_makestep,
     }
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
 
 
 @mcp.tool(
@@ -1359,16 +1450,25 @@ async def ssh_linux_prepare_client(params: str) -> str:
 )
 async def ssh_linux_prepare_client_batch(params: str) -> str:
     """Prepare multiple Linux clients in parallel. Use dry_run=true first."""
+    timing = _Timing()
     params = _parse_tool_params(params, LinuxPrepareClientBatchInput)
+    timing.mark("parse_params")
     script = _build_linux_prepare_script(**_linux_prepare_options_from_input(params))
+    timing.mark("build_script")
     sem = asyncio.Semaphore(params.max_concurrency)
 
     async def _run_one(entry: SSHBatchHostEntry) -> dict:
+        host_timing = _Timing(_ENABLE_TIMING and _ENABLE_TIMING_DETAIL)
         label = entry.name or entry.host or "unknown"
         try:
             conn = entry.resolve()
+            host_timing.mark("resolve")
         except ValueError as e:
-            return {"host": label, "name": entry.name, "success": False, "error": str(e)}
+            host_timing.mark("resolve")
+            return _attach_timing(
+                {"host": label, "name": entry.name, "success": False, "error": str(e)},
+                host_timing,
+            )
         async with sem:
             result = await asyncio.to_thread(
                 _ssh_sftp_upload_and_run,
@@ -1377,19 +1477,21 @@ async def ssh_linux_prepare_client_batch(params: str) -> str:
                 script_content=script, interpreter="/bin/bash",
                 timeout=params.timeout, use_sudo=False,
             )
+        host_timing.mark("script_upload_exec_total")
         result["host"] = conn["host"]
         result["name"] = entry.name
         result["dry_run"] = params.dry_run
-        return result
+        return _attach_timing(result, host_timing)
 
     start_ts = time.time()
     results = await asyncio.gather(*[_run_one(h) for h in params.hosts])
+    timing.mark("batch_gather")
     elapsed = round(time.time() - start_ts, 2)
     total = len(results)
     success = sum(1 for r in results if r.get("success"))
     logger.info("ssh_linux_prepare_client_batch: %d hosts, %d ok, %d failed, %.1fs",
                 total, success, total - success, elapsed)
-    return json.dumps({
+    response = {
         "summary": {
             "total": total, "success": success,
             "failed": total - success, "elapsed_seconds": elapsed,
@@ -1402,7 +1504,9 @@ async def ssh_linux_prepare_client_batch(params: str) -> str:
             },
         },
         "results": list(results),
-    }, indent=2, ensure_ascii=False)
+    }
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(response, timing), indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1670,6 +1774,7 @@ async def ssh_mcp_version() -> str:
     Use this tool to verify that the local (laptop) and remote (10.128.58.70)
     deployments are running the same code version.
     """
+    timing = _Timing()
     info = {
         "success": True,
         "version": __version__,
@@ -1689,9 +1794,12 @@ async def ssh_mcp_version() -> str:
             "ssh_script_batch",
             "ssh_linux_prepare_client",
             "ssh_linux_prepare_client_batch",
+            "timing",
         ],
     }
-    return json.dumps(info, indent=2, ensure_ascii=False)
+    timing.mark("gather_info")
+    timing.mark("attach_timing")
+    return json.dumps(_attach_timing(info, timing), indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
