@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # Version info
 # ---------------------------------------------------------------------------
 
-__version__ = "2.3.1"
+__version__ = "2.4.0"
 
 # ---------------------------------------------------------------------------
 # Platform-aware configuration
@@ -208,6 +208,8 @@ def _build_host_list(creds: dict) -> list:
             "host": info.get("host", ""),
             "port": info.get("port", 22),
             "username": info.get("username", ""),
+            "password": info.get("password", ""),
+            "private_key_path": info.get("private_key_path"),
             "description": info.get("description", ""),
             "device_type": info.get("device_type", "linux"),
         }
@@ -219,7 +221,7 @@ def _resolve_host(name_or_ip: str) -> Optional[dict]:
     """
     Resolve a host reference to connection parameters.
     Accepts either a credential name, numeric ID, or an IP/hostname.
-    Returns dict with host, port, username, password keys; None if not found.
+    Returns dict with host, port, username, password, private_key_path keys; None if not found.
     """
     creds = _load_credentials()
     hosts = creds.get("hosts", {})
@@ -231,7 +233,8 @@ def _resolve_host(name_or_ip: str) -> Optional[dict]:
             "host": entry["host"],
             "port": entry.get("port", 22),
             "username": entry.get("username", "root"),
-            "password": entry.get("password", ""),
+            "password": entry.get("password"),
+            "private_key_path": entry.get("private_key_path"),
         }
 
     # Try numeric ID (e.g., "1", "2", etc.)
@@ -245,7 +248,8 @@ def _resolve_host(name_or_ip: str) -> Optional[dict]:
                 "host": entry["host"],
                 "port": entry.get("port", 22),
                 "username": entry.get("username", "root"),
-                "password": entry.get("password", ""),
+                "password": entry.get("password"),
+                "private_key_path": entry.get("private_key_path"),
             }
         return None
 
@@ -282,19 +286,43 @@ def _truncate_output(text: str, label: str = "output") -> str:
     return text
 
 
-def _ssh_connect(host, port, username, password):
-    """Create and return a connected SSH client."""
+def _ssh_connect(host, port, username, password=None, private_key_path=None):
+    """Create and return a connected SSH client.
+
+    Supports both password and key-based authentication.
+    If private_key_path is provided, it will be used for authentication.
+    Otherwise, falls back to password authentication.
+    """
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=15,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+
+    connect_kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": 15,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+
+    if private_key_path:
+        # Key-based authentication
+        key_path = os.path.expanduser(private_key_path)
+        try:
+            # Try to load the private key
+            pkey = paramiko.Ed25519Key.from_private_key_file(key_path)
+        except (paramiko.SSHException, FileNotFoundError, IOError):
+            try:
+                # Fallback to RSA key
+                pkey = paramiko.RSAKey.from_private_key_file(key_path)
+            except (paramiko.SSHException, FileNotFoundError, IOError) as e:
+                raise paramiko.SSHException(f"Failed to load private key from {key_path}: {e}")
+        connect_kwargs["pkey"] = pkey
+    elif password:
+        # Password authentication
+        connect_kwargs["password"] = password
+
+    client.connect(**connect_kwargs)
     return client
 
 
@@ -302,15 +330,16 @@ def _ssh_sftp_write(
     host: str,
     port: int,
     username: str,
-    password: str,
-    remote_path: str,
-    content: str,
+    password: str = None,
+    remote_path: str = None,
+    content: str = None,
     mode: int = 0o644,
+    private_key_path: str = None,
 ) -> dict:
     """Write content to a remote file via SFTP. No shell escaping needed."""
     client = None
     try:
-        client = _ssh_connect(host, port, username, password)
+        client = _ssh_connect(host, port, username, password, private_key_path)
         sftp = client.open_sftp()
         with sftp.file(remote_path, "w") as f:
             f.write(content)
@@ -333,17 +362,18 @@ def _ssh_sftp_upload_and_run(
     host: str,
     port: int,
     username: str,
-    password: str,
-    script_content: str,
+    password: str = None,
+    script_content: str = None,
     interpreter: str = "/bin/bash",
     timeout: int = 120,
     use_sudo: bool = False,
+    private_key_path: str = None,
 ) -> dict:
     """Upload a script via SFTP and execute it. No heredoc issues."""
     tmp_script = f"/tmp/.ssh_mcp_{uuid.uuid4().hex[:16]}.sh"
     client = None
     try:
-        client = _ssh_connect(host, port, username, password)
+        client = _ssh_connect(host, port, username, password, private_key_path)
 
         # Upload via SFTP - binary transfer, no shell parsing
         sftp = client.open_sftp()
@@ -394,17 +424,18 @@ def _ssh_exec_command(
     host: str,
     port: int,
     username: str,
-    password: str,
-    command: str,
+    password: str = None,
+    command: str = None,
     timeout: int = 30,
     use_sudo: bool = False,
+    private_key_path: str = None,
 ) -> dict:
     """Execute a command over SSH and return structured result."""
     client = None
     try:
-        client = _ssh_connect(host, port, username, password)
+        client = _ssh_connect(host, port, username, password, private_key_path)
 
-        if use_sudo and username != "root":
+        if use_sudo and username != "root" and password:
             command = f"echo '{password}' | sudo -S bash -c '{command}'"
 
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -448,29 +479,20 @@ def _ssh_interactive_session(
     host: str,
     port: int,
     username: str,
-    password: str,
-    commands: list[str],
+    password: str = None,
+    commands: list[str] = None,
     prompt_pattern: str = r"[#\$>]\s*$",
     timeout: int = 30,
     command_interval: float = 0.5,
+    private_key_path: str = None,
 ) -> dict:
     """
     Interactive SSH session for devices like ONTAP that need shell mode.
     Sends commands one by one and waits for the prompt between them.
     """
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client = _ssh_connect(host, port, username, password, private_key_path)
     full_output = ""
     try:
-        client.connect(
-            hostname=host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=15,
-            look_for_keys=False,
-            allow_agent=False,
-        )
         shell = client.invoke_shell(width=200, height=50)
         shell.settimeout(timeout)
 
@@ -717,7 +739,11 @@ class CredentialSaveInput(BaseModel):
     host: str = Field(..., description="Hostname or IP address.")
     port: int = Field(default=22, description="SSH port.", ge=1, le=65535)
     username: str = Field(default="root", description="SSH username.")
-    password: str = Field(..., description="SSH password.")
+    password: Optional[str] = Field(default=None, description="SSH password. Not required if private_key_path is provided.")
+    private_key_path: Optional[str] = Field(
+        default=None,
+        description="Path to SSH private key file (e.g. '~/.ssh/id_ed25519'). If provided, key-based authentication will be used instead of password.",
+    )
     description: str = Field(
         default="", description="Optional description of this host."
     )
@@ -745,6 +771,7 @@ class CredentialUpdateInput(BaseModel):
     port: Optional[int] = Field(default=None, description="New SSH port.", ge=1, le=65535)
     username: Optional[str] = Field(default=None, description="New SSH username.")
     password: Optional[str] = Field(default=None, description="New SSH password.")
+    private_key_path: Optional[str] = Field(default=None, description="New SSH private key path.")
     description: Optional[str] = Field(default=None, description="New description.")
     device_type: Optional[str] = Field(default=None, description="Device type: linux or ontap.")
 
@@ -808,10 +835,11 @@ async def ssh_execute(params: str) -> str:
         host=conn["host"],
         port=conn["port"],
         username=conn["username"],
-        password=conn["password"],
+        password=conn.get("password"),
         command=command,
         timeout=params.timeout,
         use_sudo=params.use_sudo,
+        private_key_path=conn.get("private_key_path"),
     )
     timing.mark("ssh_exec")
     timing.mark("attach_timing")
@@ -857,11 +885,12 @@ async def ssh_interactive(params: str) -> str:
         host=conn["host"],
         port=conn["port"],
         username=conn["username"],
-        password=conn["password"],
+        password=conn.get("password"),
         commands=params.commands,
         prompt_pattern=params.prompt_pattern,
         timeout=params.timeout,
         command_interval=params.command_interval,
+        private_key_path=conn.get("private_key_path"),
     )
     timing.mark("interactive_session")
     timing.mark("attach_timing")
@@ -903,10 +932,11 @@ async def ssh_file_read(params: str) -> str:
         host=conn["host"],
         port=conn["port"],
         username=conn["username"],
-        password=conn["password"],
+        password=conn.get("password"),
         command=cmd,
         timeout=15,
         use_sudo=params.use_sudo,
+        private_key_path=conn.get("private_key_path"),
     )
     timing.mark("ssh_exec")
     timing.mark("attach_timing")
@@ -942,9 +972,10 @@ async def ssh_file_write(params: str) -> str:
             host=conn["host"],
             port=conn["port"],
             username=conn["username"],
-            password=conn["password"],
+            password=conn.get("password"),
             command=f"[ -f {params.file_path} ] && cp {params.file_path} {params.file_path}.bak",
             timeout=10,
+            private_key_path=conn.get("private_key_path"),
         )
         timing.mark("backup_existing")
 
@@ -956,9 +987,10 @@ async def ssh_file_write(params: str) -> str:
             host=conn["host"],
             port=conn["port"],
             username=conn["username"],
-            password=conn["password"],
+            password=conn.get("password"),
             remote_path=tmp_path,
             content=params.content,
+            private_key_path=conn.get("private_key_path"),
         )
         timing.mark("sftp_write_temp")
         if not write_result.get("success"):
@@ -971,9 +1003,10 @@ async def ssh_file_write(params: str) -> str:
             host=conn["host"],
             port=conn["port"],
             username=conn["username"],
-            password=conn["password"],
+            password=conn.get("password"),
             command=f"sudo mv {tmp_path} {params.file_path}",
             timeout=10,
+            private_key_path=conn.get("private_key_path"),
         )
         timing.mark("sudo_move")
         if move_result["success"]:
@@ -987,9 +1020,10 @@ async def ssh_file_write(params: str) -> str:
             host=conn["host"],
             port=conn["port"],
             username=conn["username"],
-            password=conn["password"],
+            password=conn.get("password"),
             remote_path=params.file_path,
             content=params.content,
+            private_key_path=conn.get("private_key_path"),
         )
         timing.mark("sftp_write")
         if result.get("success"):
@@ -1039,11 +1073,12 @@ async def ssh_script(params: str) -> str:
         host=conn["host"],
         port=conn["port"],
         username=conn["username"],
-        password=conn["password"],
+        password=conn.get("password"),
         script_content=params.script_content,
         interpreter=params.interpreter,
         timeout=params.timeout,
         use_sudo=params.use_sudo,
+        private_key_path=conn.get("private_key_path"),
     )
     timing.mark("script_upload_exec_total")
     timing.mark("attach_timing")
@@ -1064,6 +1099,7 @@ class SSHBatchHostEntry(BaseModel):
     port: int = Field(default=22, ge=1, le=65535)
     username: Optional[str] = Field(default=None)
     password: Optional[str] = Field(default=None)
+    private_key_path: Optional[str] = Field(default=None, description="SSH private key path.")
     command: Optional[str] = Field(default=None,
         description="Per-host command override (ssh_execute_batch only).")
     script_content: Optional[str] = Field(default=None,
@@ -1078,7 +1114,8 @@ class SSHBatchHostEntry(BaseModel):
         if not self.host or not self.username:
             raise ValueError("Either name or host+username+password required.")
         return {"host": self.host, "port": self.port,
-                "username": self.username, "password": self.password or ""}
+                "username": self.username, "password": self.password or "",
+                "private_key_path": self.private_key_path}
 
 
 class SSHBatchExecuteInput(BaseModel):
@@ -1159,8 +1196,9 @@ async def ssh_execute_batch(params: str) -> str:
             result = await asyncio.to_thread(
                 _ssh_exec_command,
                 host=conn["host"], port=conn["port"],
-                username=conn["username"], password=conn["password"],
+                username=conn["username"], password=conn.get("password"),
                 command=cmd, timeout=params.timeout, use_sudo=params.use_sudo,
+                private_key_path=conn.get("private_key_path"),
             )
         host_timing.mark("ssh_exec")
         result["host"] = conn["host"]
@@ -1226,9 +1264,10 @@ async def ssh_script_batch(params: str) -> str:
             result = await asyncio.to_thread(
                 _ssh_sftp_upload_and_run,
                 host=conn["host"], port=conn["port"],
-                username=conn["username"], password=conn["password"],
+                username=conn["username"], password=conn.get("password"),
                 script_content=script, interpreter=params.interpreter,
                 timeout=params.timeout, use_sudo=params.use_sudo,
+                private_key_path=conn.get("private_key_path"),
             )
         host_timing.mark("script_upload_exec_total")
         result["host"] = conn["host"]
@@ -1443,9 +1482,10 @@ async def ssh_linux_prepare_client(params: str) -> str:
     result = await asyncio.to_thread(
         _ssh_sftp_upload_and_run,
         host=conn["host"], port=conn["port"],
-        username=conn["username"], password=conn["password"],
+        username=conn["username"], password=conn.get("password"),
         script_content=script, interpreter="/bin/bash",
         timeout=params.timeout, use_sudo=False,
+        private_key_path=conn.get("private_key_path"),
     )
     timing.mark("script_upload_exec_total")
     result["host"] = conn["host"]
@@ -1494,9 +1534,10 @@ async def ssh_linux_prepare_client_batch(params: str) -> str:
             result = await asyncio.to_thread(
                 _ssh_sftp_upload_and_run,
                 host=conn["host"], port=conn["port"],
-                username=conn["username"], password=conn["password"],
+                username=conn["username"], password=conn.get("password"),
                 script_content=script, interpreter="/bin/bash",
                 timeout=params.timeout, use_sudo=False,
+                private_key_path=conn.get("private_key_path"),
             )
         host_timing.mark("script_upload_exec_total")
         result["host"] = conn["host"]
@@ -1561,6 +1602,7 @@ async def ssh_credential_save(params: str) -> str:
         "port": params.port,
         "username": params.username,
         "password": params.password,
+        "private_key_path": params.private_key_path,
         "description": params.description,
         "device_type": params.device_type,
     }
@@ -1579,6 +1621,7 @@ async def ssh_credential_save(params: str) -> str:
             "host": params.host,
             "port": params.port,
             "username": params.username,
+            "private_key_path": params.private_key_path,
             "description": params.description,
             "device_type": params.device_type,
         },
@@ -1622,7 +1665,6 @@ async def ssh_credential_list() -> str:
 
     # 构建结构化的主机列表，包含所有字段（密码和类型也显示）
     host_list = []
-    host_list = []
     for idx, (name, info) in enumerate(hosts.items(), start=1):
         host_list.append({
             "id": idx,
@@ -1631,18 +1673,20 @@ async def ssh_credential_list() -> str:
             "port": info.get("port", 22),
             "username": info.get("username", ""),
             "password": info.get("password", ""),  # 密码明文显示
+            "private_key_path": info.get("private_key_path"),
             "description": info.get("description", ""),
             "device_type": info.get("device_type", "linux"),
         })
 
     # 构建 Markdown 表格，美观且所有字段都显示
     lines = []
-    lines.append("| ID | 名称 | IP 地址 | 端口 | 用户名 | 密码 | 类型 | 描述 |")
-    lines.append("|----|------|---------|------|--------|------|------|------|")
+    lines.append("| ID | 名称 | IP 地址 | 端口 | 用户名 | 密码 | 密钥路径 | 类型 | 描述 |")
+    lines.append("|----|------|---------|------|--------|------|----------|------|------|")
     for h in host_list:
-        row = "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+        row = "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
             h["id"], h["name"], h["host"], h["port"],
-            h["username"], h["password"], h["device_type"], h["description"]
+            h["username"], h["password"], h.get("private_key_path") or "-",
+            h["device_type"], h["description"]
         )
         lines.append(row)
     markdown_table = "\n".join(lines)
@@ -1763,6 +1807,10 @@ async def ssh_credential_update(params: str) -> str:
     if params.password is not None:
         host_info["password"] = params.password
         changes.append("password: ***")
+    if params.private_key_path is not None:
+        old = host_info.get("private_key_path")
+        host_info["private_key_path"] = params.private_key_path
+        changes.append(f"private_key_path: {old} -> {params.private_key_path}")
     if params.description is not None:
         old = host_info.get("description", "")
         host_info["description"] = params.description
@@ -1790,6 +1838,8 @@ async def ssh_credential_update(params: str) -> str:
             "host": host_info["host"],
             "port": host_info["port"],
             "username": host_info["username"],
+            "password": host_info.get("password"),
+            "private_key_path": host_info.get("private_key_path"),
             "description": host_info.get("description", ""),
             "device_type": host_info.get("device_type", "linux"),
         },
@@ -1842,6 +1892,7 @@ async def ssh_mcp_version() -> str:
             "ssh_linux_prepare_client_batch",
             "timing",
             "timing_all_tools",
+            "key_auth",
         ],
     }
     timing.mark("gather_info")
