@@ -8,7 +8,8 @@ This working copy implements the structured transport improvements requested
 for Hermes and other MCP clients. The source was cloned from
 `https://github.com/lizy0327/ssh-mcp` at commit
 `13dd761c0279b3dffc323b632fe3e62ed76dcc1c` (`main`). The optimization was
-committed and pushed as `8d15da808ff196276e31d484c29b267b99ffd8b1` on `main`.
+committed and pushed as `8d15da808ff196276e31d484c29b267b99ffd8b1` on `main`,
+with capability-reporting follow-up `02efa7e`.
 
 Release version: **2.5.0**
 
@@ -52,27 +53,27 @@ returns a structured validation failure.
 
 ## Deployment state
 
-The GitHub push completed, but the remote deployment did not proceed and the
-currently running `10.128.58.70` instance was not changed:
+Deployment to `root@10.128.58.70:2345` completed successfully using the
+dedicated `id_ed25519_vm70` key. Before each source replacement, the target
+file was backed up and the uploaded candidate passed
+`/opt/ssh-mcp/venv/bin/python3.11 -m py_compile`. The service was then restarted
+and verified active.
 
-- Direct SSH to `10.128.58.70:22` timed out.
-- The existing SSH-MCP entry for that host (`vm70`, port `2345`) rejected
-  authentication during a read-only service-status check.
+Current live state:
 
-No source file was uploaded, no service was restarted, and no remote backup was
-created. The remote instance previously reported version `2.4.0` and remains
-unchanged.
+- Service: `ssh-mcp.service` is `active (running)`.
+- Remote `ssh_mcp_version`: `2.5.0`, SSE on port `9876`, host `vm70`.
+- Feature list includes `ssh_execute_v2` and `ssh_script_v2`.
+- Deployed source SHA-256:
+  `e8ce4ff34aabea1653e12ed2ccabdb92ba14d523a245b6e3fbabbfd599e72a7c`.
+- Latest rollback backup:
+  `/opt/ssh-mcp/ssh_mcp_server.py.bak.20260911_172158`.
 
 ## Recommended release sequence
 
-1. Restore a working authenticated SSH path for `root@10.128.58.70` without
-   changing the deployed service. The repository deployment script expects
-   key-based SSH on port 22; alternatively, update the stale SSH-MCP target
-   credential through the approved credential-management path.
-2. Deploy using `scripts/deploy_to_58_70.ps1` through the established
-   deployment workflow, which backs up the remote server file and verifies the
-   service after restart.
-3. Refresh Hermes's MCP tool discovery and route new calls to the `*_v2`
+1. Refresh Hermes's MCP tool discovery and route new calls to the `*_v2`
    tools. Keep legacy tools enabled during migration.
-4. Capture and redact the first real Hermes failures, if any, and add them as
+2. Capture and redact the first real Hermes failures, if any, and add them as
    regression cases before altering the calling rules again.
+3. Periodically prune only explicitly approved old backup files after confirming
+   the new version is stable.
