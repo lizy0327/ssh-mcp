@@ -7,8 +7,8 @@ Updated: 2026-09-12
 This working copy implements the structured transport improvements requested
 for Hermes and other MCP clients. The source was cloned from
 `https://github.com/lizy0327/ssh-mcp` at commit
-`13dd761c0279b3dffc323b632fe3e62ed76dcc1c` (`main`) and is now modified but
-not committed or pushed.
+`13dd761c0279b3dffc323b632fe3e62ed76dcc1c` (`main`). The optimization was
+committed and pushed as `8d15da808ff196276e31d484c29b267b99ffd8b1` on `main`.
 
 Release version: **2.5.0**
 
@@ -52,21 +52,27 @@ returns a structured validation failure.
 
 ## Deployment state
 
-No remote deployment, service restart, credential inspection, or change to the
-currently running `10.128.58.70` instance was performed. The remote instance
-previously reported version `2.4.0`; it remains unchanged until this work is
-reviewed, committed, pushed, and deployed through the repository's existing
-deployment workflow.
+The GitHub push completed, but the remote deployment did not proceed and the
+currently running `10.128.58.70` instance was not changed:
+
+- Direct SSH to `10.128.58.70:22` timed out.
+- The existing SSH-MCP entry for that host (`vm70`, port `2345`) rejected
+  authentication during a read-only service-status check.
+
+No source file was uploaded, no service was restarted, and no remote backup was
+created. The remote instance previously reported version `2.4.0` and remains
+unchanged.
 
 ## Recommended release sequence
 
-1. Review the diff and run the validation commands above on the Windows source
-   environment.
-2. Commit and push the 2.5.0 changes.
-3. Deploy using `scripts/deploy_to_58_70.ps1` through the established
+1. Restore a working authenticated SSH path for `root@10.128.58.70` without
+   changing the deployed service. The repository deployment script expects
+   key-based SSH on port 22; alternatively, update the stale SSH-MCP target
+   credential through the approved credential-management path.
+2. Deploy using `scripts/deploy_to_58_70.ps1` through the established
    deployment workflow, which backs up the remote server file and verifies the
    service after restart.
-4. Refresh Hermes's MCP tool discovery and route new calls to the `*_v2`
+3. Refresh Hermes's MCP tool discovery and route new calls to the `*_v2`
    tools. Keep legacy tools enabled during migration.
-5. Capture and redact the first real Hermes failures, if any, and add them as
+4. Capture and redact the first real Hermes failures, if any, and add them as
    regression cases before altering the calling rules again.
