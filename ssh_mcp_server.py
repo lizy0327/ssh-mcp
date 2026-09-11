@@ -2119,7 +2119,9 @@ async def ssh_mcp_version() -> str:
         "hostname": platform.node(),
         "features": [
             "ssh_execute",
+            "ssh_execute_v2",
             "ssh_script",
+            "ssh_script_v2",
             "ssh_execute_batch",
             "ssh_script_batch",
             "ssh_linux_prepare_client",
