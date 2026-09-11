@@ -3,6 +3,26 @@
 All notable changes to ssh-mcp are recorded here. Bump `__version__` in
 `ssh_mcp_server.py` and `pyproject.toml` together when releasing.
 
+## [2.5.0] - 2026-09-12
+
+### Added
+- `ssh_execute_v2` and `ssh_script_v2`, which expose normal MCP fields instead
+  of a JSON string nested in `params`.
+- `stdin_text` for command execution. The server writes it and closes stdin,
+  preventing commands waiting for more input from hanging indefinitely.
+- Stable machine-readable failure categories: `validation`, `policy`,
+  `stdin_required`, `tty_required`, `remote_exit`, `auth`, and `connection`.
+- Regression tests for the generated MCP schemas, stdin transport, policy IDs,
+  and legacy invalid-JSON handling.
+
+### Changed
+- `sudo` now receives its password through stdin; it is no longer embedded in
+  an `echo ... | sudo` shell command.
+- Blocked commands return a stable policy identifier instead of exposing the
+  matching regular expression as the client-facing error.
+- The MCP dependency is constrained to `<2.0.0`, because this code imports the
+  FastMCP API removed in MCP 2.x.
+
 ## [2.0.0] - 2026-04-17
 
 First version with a proper Git repo, dual-host deployment (Windows laptop +

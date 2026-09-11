@@ -16,15 +16,47 @@ access). Syncing is handled by the `deploy-ssh-mcp` skill (see below).
 | Tool                    | Purpose                                       |
 |-------------------------|-----------------------------------------------|
 | `ssh_execute`           | Run a shell command on a remote Linux host.  |
+| `ssh_execute_v2`        | Run a command with native structured MCP fields and optional stdin. |
 | `ssh_interactive`       | Interactive shell (for ONTAP, switches).     |
 | `ssh_file_read`         | Read a remote file.                           |
 | `ssh_file_write`        | Write a remote file via SFTP.                 |
 | `ssh_script`            | Upload and execute a script on the remote.   |
+| `ssh_script_v2`         | Upload and execute a structured multi-line script through SFTP. |
 | `ssh_credential_save`   | Save SSH connection info.                     |
 | `ssh_credential_list`   | List saved credentials (passwords masked).   |
 | `ssh_credential_delete` | Remove a saved credential.                    |
 | `ssh_credential_update` | Partial-update a saved credential.            |
 | `ssh_mcp_version`       | Report version/platform/transport - use to verify the two deployments match. |
+
+## Structured transport for Hermes and other MCP clients
+
+`ssh_execute` and `ssh_script` remain available for compatibility, but their
+single `params` string requires JSON to be encoded inside another JSON tool
+call. New clients should use the `*_v2` tools instead.
+
+Use the narrowest mode that fits the work:
+
+| Situation | Tool | Rule |
+|---|---|---|
+| One non-interactive command | `ssh_execute_v2` | Pass `command` directly. Do not wrap it in `bash -c`. |
+| A command or script needs ordinary standard input | `ssh_execute_v2` or `ssh_script_v2` | Pass `stdin_text`; the server closes stdin after writing it. |
+| Pipes, redirects, variables, embedded JSON, or multiple lines | `ssh_script_v2` | Pass the complete content in `script`; do not wrap it in a heredoc. |
+| A terminal prompt or device CLI is required | `ssh_interactive` | Use the prompt-driven session rather than simulating a TTY with stdin. |
+
+The v2 tools return a stable `error_type` on failures: `validation`, `policy`,
+`stdin_required`, `tty_required`, `remote_exit`, `auth`, or `connection`.
+Policy rejections include a `policy_id`, so callers must not try to evade them
+by changing shell quoting.
+
+Examples:
+
+```json
+{"name":"client-a","command":"uptime","timeout":30}
+```
+
+```json
+{"name":"client-a","script":"set -euo pipefail\nprintf '%s\\n' 'safe payload'\n","interpreter":"/bin/bash"}
+```
 
 ## Local install (Windows 11)
 

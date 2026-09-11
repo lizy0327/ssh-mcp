@@ -21,6 +21,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import sys
 try:
     import fcntl
@@ -33,13 +34,13 @@ from typing import Optional
 
 import paramiko
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, ValidationError
 
 # ---------------------------------------------------------------------------
 # Version info
 # ---------------------------------------------------------------------------
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 # ---------------------------------------------------------------------------
 # Platform-aware configuration
@@ -88,16 +89,18 @@ CREDENTIALS_FILE = os.environ.get(
     str(_default_credentials_path()),
 )
 
-# Safety: commands that are blocked by default
+# Safety: commands that are blocked by default.  Keep the policy identifier
+# separate from the matching expression so clients can distinguish a policy
+# rejection from a malformed tool call or a remote command failure.
 BLOCKED_COMMANDS = [
-    r"\brm\s+-rf\s+/\s*$",
-    r"\bmkfs\b",
-    r"\bdd\s+.*of=/dev/",
-    r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;",  # fork bomb
-    r"\bshutdown\b",
-    r"\breboot\b",
-    r"\binit\s+0\b",
-    r"\bhalt\b",
+    ("filesystem-root-delete", r"\brm\s+-rf\s+/\s*$"),
+    ("filesystem-format", r"\bmkfs\b"),
+    ("raw-device-write", r"\bdd\s+.*of=/dev/"),
+    ("fork-bomb", r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;"),
+    ("host-shutdown", r"\bshutdown\b"),
+    ("host-reboot", r"\breboot\b"),
+    ("host-halt", r"\binit\s+0\b"),
+    ("host-halt", r"\bhalt\b"),
 ]
 
 # Output truncation limits
@@ -261,12 +264,48 @@ def _resolve_host(name_or_ip: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _check_blocked(command: str) -> Optional[str]:
-    """Check if a command matches any blocked patterns."""
-    for pattern in BLOCKED_COMMANDS:
+def _check_blocked(command: str) -> Optional[dict]:
+    """Return structured policy metadata when a command is blocked."""
+    for policy_id, pattern in BLOCKED_COMMANDS:
         if re.search(pattern, command):
-            return f"BLOCKED: Command matches dangerous pattern: {pattern}"
+            return {"policy_id": policy_id, "pattern": pattern}
     return None
+
+
+def _tool_error(error_type: str, message: str, **details) -> dict:
+    """Return a machine-readable failure response for MCP clients."""
+    result = {"success": False, "error_type": error_type, "message": message}
+    result.update({key: value for key, value in details.items() if value is not None})
+    return result
+
+
+def _classify_remote_failure(exit_code: int, stderr: str) -> dict:
+    """Classify common remote failures without trying to rewrite a command."""
+    lowered = stderr.lower()
+    if "a terminal is required" in lowered or "no tty present" in lowered:
+        return _tool_error(
+            "tty_required",
+            "The remote command requires a TTY. Use ssh_interactive for a prompt-driven session.",
+            exit_code=exit_code,
+        )
+    if "password is required" in lowered and "sudo" in lowered:
+        return _tool_error(
+            "stdin_required",
+            "sudo requires input. Supply stdin_text or use a key/NOPASSWD sudo policy.",
+            exit_code=exit_code,
+        )
+    return _tool_error(
+        "remote_exit",
+        "The remote command exited with a non-zero status.",
+        exit_code=exit_code,
+    )
+
+
+def _ssh_failure(error_type: str, message: str, stderr: str) -> dict:
+    """Create a structured SSH transport failure while retaining stderr."""
+    result = _tool_error(error_type, message, exit_code=-1)
+    result.update({"stdout": "", "stderr": stderr})
+    return result
 
 
 def _truncate_output(text: str, label: str = "output") -> str:
@@ -368,6 +407,7 @@ def _ssh_sftp_upload_and_run(
     timeout: int = 120,
     use_sudo: bool = False,
     private_key_path: str = None,
+    stdin_text: Optional[str] = None,
 ) -> dict:
     """Upload a script via SFTP and execute it. No heredoc issues."""
     tmp_script = f"/tmp/.ssh_mcp_{uuid.uuid4().hex[:16]}.sh"
@@ -383,12 +423,19 @@ def _ssh_sftp_upload_and_run(
         sftp.close()
 
         # Execute
+        stdin_payload = stdin_text or ""
         if use_sudo and username != "root":
-            exec_cmd = f"sudo {interpreter} {tmp_script}"
+            exec_cmd = f"sudo -S -p '' {shlex.quote(interpreter)} {shlex.quote(tmp_script)}"
+            if password:
+                stdin_payload = f"{password}\n{stdin_payload}"
         else:
-            exec_cmd = f"{interpreter} {tmp_script}"
+            exec_cmd = f"{shlex.quote(interpreter)} {shlex.quote(tmp_script)}"
 
         stdin, stdout, stderr = client.exec_command(exec_cmd, timeout=timeout)
+        if stdin_payload:
+            stdin.write(stdin_payload)
+            stdin.flush()
+        stdin.channel.shutdown_write()
         exit_code = stdout.channel.recv_exit_status()
         stdout_text = stdout.read().decode("utf-8", errors="replace")
         stderr_text = stderr.read().decode("utf-8", errors="replace")
@@ -399,22 +446,25 @@ def _ssh_sftp_upload_and_run(
         except Exception:
             pass
 
-        return {
+        result = {
             "success": exit_code == 0,
             "exit_code": exit_code,
             "stdout": _truncate_output(stdout_text, "stdout"),
             "stderr": _truncate_output(stderr_text, "stderr"),
         }
+        if exit_code != 0:
+            result.update(_classify_remote_failure(exit_code, stderr_text))
+            result["stdout"] = _truncate_output(stdout_text, "stdout")
+            result["stderr"] = _truncate_output(stderr_text, "stderr")
+        return result
     except paramiko.AuthenticationException:
-        return {
-            "success": False, "exit_code": -1, "stdout": "",
-            "stderr": f"Authentication failed for {username}@{host}:{port}.",
-        }
+        return _ssh_failure(
+            "auth",
+            f"Authentication failed for {username}@{host}:{port}.",
+            f"Authentication failed for {username}@{host}:{port}.",
+        )
     except Exception as e:
-        return {
-            "success": False, "exit_code": -1, "stdout": "",
-            "stderr": f"{type(e).__name__}: {e}",
-        }
+        return _ssh_failure("connection", f"Unable to execute the remote script: {type(e).__name__}.", f"{type(e).__name__}: {e}")
     finally:
         if client:
             client.close()
@@ -429,47 +479,61 @@ def _ssh_exec_command(
     timeout: int = 30,
     use_sudo: bool = False,
     private_key_path: str = None,
+    stdin_text: Optional[str] = None,
 ) -> dict:
     """Execute a command over SSH and return structured result."""
     client = None
     try:
         client = _ssh_connect(host, port, username, password, private_key_path)
 
-        if use_sudo and username != "root" and password:
-            command = f"echo '{password}' | sudo -S bash -c '{command}'"
+        # Never interpolate a credential into a shell command.  Passing the
+        # password over stdin also makes commands containing quotes work as-is.
+        stdin_payload = stdin_text or ""
+        if use_sudo and username != "root":
+            command = f"sudo -S -p '' /bin/sh -c {shlex.quote(command)}"
+            if password:
+                stdin_payload = f"{password}\n{stdin_payload}"
 
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        if stdin_payload:
+            stdin.write(stdin_payload)
+            stdin.flush()
+        # Tell programs reading standard input that no additional data is
+        # coming.  This prevents a command using `read` from hanging forever.
+        stdin.channel.shutdown_write()
         exit_code = stdout.channel.recv_exit_status()
         stdout_text = stdout.read().decode("utf-8", errors="replace")
         stderr_text = stderr.read().decode("utf-8", errors="replace")
 
-        return {
+        result = {
             "success": exit_code == 0,
             "exit_code": exit_code,
             "stdout": _truncate_output(stdout_text, "stdout"),
             "stderr": _truncate_output(stderr_text, "stderr"),
         }
+        if exit_code != 0:
+            result.update(_classify_remote_failure(exit_code, stderr_text))
+            result["stdout"] = _truncate_output(stdout_text, "stdout")
+            result["stderr"] = _truncate_output(stderr_text, "stderr")
+        return result
     except paramiko.AuthenticationException:
-        return {
-            "success": False,
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": f"Authentication failed for {username}@{host}:{port}. Check username/password.",
-        }
+        return _ssh_failure(
+            "auth",
+            f"Authentication failed for {username}@{host}:{port}.",
+            f"Authentication failed for {username}@{host}:{port}. Check username/password.",
+        )
     except paramiko.SSHException as e:
-        return {
-            "success": False,
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": f"SSH error connecting to {host}:{port}: {e}",
-        }
+        return _ssh_failure(
+            "connection",
+            f"SSH error connecting to {host}:{port}.",
+            f"SSH error connecting to {host}:{port}: {e}",
+        )
     except Exception as e:
-        return {
-            "success": False,
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": f"Connection error to {host}:{port}: {type(e).__name__}: {e}",
-        }
+        return _ssh_failure(
+            "connection",
+            f"Connection error to {host}:{port}.",
+            f"Connection error to {host}:{port}: {type(e).__name__}: {e}",
+        )
     finally:
         if client:
             client.close()
@@ -583,6 +647,10 @@ class SSHTarget(BaseModel):
     password: Optional[str] = Field(
         default=None, description="SSH password. Required if 'name' is not provided."
     )
+    private_key_path: Optional[str] = Field(
+        default=None,
+        description="Path to an SSH private key. Takes precedence over password when provided.",
+    )
 
     def resolve(self) -> dict:
         """Resolve to concrete connection parameters."""
@@ -612,6 +680,7 @@ class SSHTarget(BaseModel):
             "port": self.port,
             "username": self.username,
             "password": self.password or "",
+            "private_key_path": self.private_key_path,
         }
 
 
@@ -637,6 +706,12 @@ class SSHExecuteInput(SSHTarget):
     cwd: Optional[str] = Field(
         default=None,
         description="Working directory. Command will cd to this path first.",
+    )
+    stdin_text: Optional[str] = Field(
+        default=None,
+        max_length=262144,
+        description="Text written to the remote command's stdin, then closed. "
+        "Use ssh_interactive when a TTY prompt is required.",
     )
 
 
@@ -723,6 +798,11 @@ class SSHScriptInput(SSHTarget):
     use_sudo: bool = Field(
         default=False, description="Run script with sudo."
     )
+    stdin_text: Optional[str] = Field(
+        default=None,
+        max_length=262144,
+        description="Text written to the script's stdin, then closed.",
+    )
 
 
 class CredentialSaveInput(BaseModel):
@@ -792,44 +872,61 @@ class CredentialUpdateInput(BaseModel):
     },
 )
 async def ssh_execute(params: str) -> str:
+    """Legacy JSON-string interface. Prefer ssh_execute_v2 for new clients."""
     timing = _Timing()
-    params = _parse_tool_params(params, SSHExecuteInput)
-    timing.mark("parse_params")
-    """Execute a shell command on a remote Linux server via SSH.
-
-    Use this tool for running diagnostics (systemctl, journalctl, df, top, etc.),
-    installing packages (yum, apt), managing services, and general troubleshooting.
-    Supports sudo and custom working directory.
-
-    Returns structured result with stdout, stderr, and exit_code.
-    """
-    conn = params.resolve()
-    command = params.command
-    timing.mark("resolve_params")
-
-    # Safety check
-    block_reason = _check_blocked(command)
-    timing.mark("safety_check")
-    if block_reason:
+    try:
+        request = _parse_tool_params(params, SSHExecuteInput)
+    except (ValueError, ValidationError) as exc:
+        timing.mark("parse_params")
         timing.mark("attach_timing")
         return json.dumps(
-            _attach_timing({"success": False, "error": block_reason}, timing),
+            _attach_timing(_tool_error("validation", str(exc)), timing),
+            indent=2,
+            ensure_ascii=False,
+        )
+    timing.mark("parse_params")
+    return await _execute_request(request, timing)
+
+
+async def _execute_request(params: SSHExecuteInput, timing: _Timing) -> str:
+    """Run one validated command request and return a JSON MCP response."""
+    try:
+        conn = params.resolve()
+    except ValueError as exc:
+        timing.mark("resolve_params")
+        timing.mark("attach_timing")
+        return json.dumps(
+            _attach_timing(_tool_error("validation", str(exc)), timing),
+            indent=2,
+            ensure_ascii=False,
+        )
+    timing.mark("resolve_params")
+
+    blocked = _check_blocked(params.command)
+    timing.mark("safety_check")
+    if blocked:
+        timing.mark("attach_timing")
+        return json.dumps(
+            _attach_timing(
+                _tool_error(
+                    "policy",
+                    "Command rejected by the SSH-MCP safety policy.",
+                    policy_id=blocked["policy_id"],
+                ),
+                timing,
+            ),
             indent=2,
             ensure_ascii=False,
         )
 
-    # Prepend cd if cwd specified
+    command = params.command
     if params.cwd:
-        command = f"cd {params.cwd} && {command}"
+        command = f"cd {shlex.quote(params.cwd)} && {command}"
 
     logger.info(
         "ssh_execute: %s@%s:%d -> %s",
-        conn["username"],
-        conn["host"],
-        conn["port"],
-        command[:100],
+        conn["username"], conn["host"], conn["port"], command[:100],
     )
-
     result = await asyncio.to_thread(
         _ssh_exec_command,
         host=conn["host"],
@@ -840,10 +937,67 @@ async def ssh_execute(params: str) -> str:
         timeout=params.timeout,
         use_sudo=params.use_sudo,
         private_key_path=conn.get("private_key_path"),
+        stdin_text=params.stdin_text,
     )
     timing.mark("ssh_exec")
     timing.mark("attach_timing")
     return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="ssh_execute_v2",
+    annotations={
+        "title": "Execute SSH Command (Structured)",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def ssh_execute_v2(
+    command: str,
+    name: Optional[str] = None,
+    host: Optional[str] = None,
+    port: int = 22,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    private_key_path: Optional[str] = None,
+    timeout: int = 30,
+    use_sudo: bool = False,
+    cwd: Optional[str] = None,
+    stdin_text: Optional[str] = None,
+) -> str:
+    """Execute one command with native MCP fields; no JSON string is required.
+
+    Use this for simple non-interactive commands.  For multi-line shell logic,
+    redirections, or heredocs, use ssh_script_v2 instead.  If the remote target
+    requires a terminal prompt, use ssh_interactive.
+    """
+    timing = _Timing()
+    try:
+        request = SSHExecuteInput(
+            command=command,
+            name=name,
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            private_key_path=private_key_path,
+            timeout=timeout,
+            use_sudo=use_sudo,
+            cwd=cwd,
+            stdin_text=stdin_text,
+        )
+    except ValidationError as exc:
+        timing.mark("validate_fields")
+        timing.mark("attach_timing")
+        return json.dumps(
+            _attach_timing(_tool_error("validation", str(exc)), timing),
+            indent=2,
+            ensure_ascii=False,
+        )
+    timing.mark("validate_fields")
+    return await _execute_request(request, timing)
 
 
 @mcp.tool(
@@ -1046,18 +1200,34 @@ async def ssh_file_write(params: str) -> str:
     },
 )
 async def ssh_script(params: str) -> str:
+    """Legacy JSON-string interface. Prefer ssh_script_v2 for new clients."""
     timing = _Timing()
-    params = _parse_tool_params(params, SSHScriptInput)
+    try:
+        request = _parse_tool_params(params, SSHScriptInput)
+    except (ValueError, ValidationError) as exc:
+        timing.mark("parse_params")
+        timing.mark("attach_timing")
+        return json.dumps(
+            _attach_timing(_tool_error("validation", str(exc)), timing),
+            indent=2,
+            ensure_ascii=False,
+        )
     timing.mark("parse_params")
-    """Upload and execute a script on a remote server.
+    return await _script_request(request, timing)
 
-    Uses SFTP for script upload - no heredoc or shell escaping issues.
-    The script can contain any characters including quotes, heredocs,
-    special characters, etc.
 
-    The script is uploaded to /tmp, executed, and then cleaned up.
-    """
-    conn = params.resolve()
+async def _script_request(params: SSHScriptInput, timing: _Timing) -> str:
+    """Upload a validated script over SFTP and execute it."""
+    try:
+        conn = params.resolve()
+    except ValueError as exc:
+        timing.mark("resolve_params")
+        timing.mark("attach_timing")
+        return json.dumps(
+            _attach_timing(_tool_error("validation", str(exc)), timing),
+            indent=2,
+            ensure_ascii=False,
+        )
     timing.mark("resolve_params")
 
     logger.info(
@@ -1079,10 +1249,66 @@ async def ssh_script(params: str) -> str:
         timeout=params.timeout,
         use_sudo=params.use_sudo,
         private_key_path=conn.get("private_key_path"),
+        stdin_text=params.stdin_text,
     )
     timing.mark("script_upload_exec_total")
     timing.mark("attach_timing")
     return json.dumps(_attach_timing(result, timing), indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="ssh_script_v2",
+    annotations={
+        "title": "Execute SSH Script (Structured)",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def ssh_script_v2(
+    script: str,
+    name: Optional[str] = None,
+    host: Optional[str] = None,
+    port: int = 22,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    private_key_path: Optional[str] = None,
+    interpreter: str = "/bin/bash",
+    timeout: int = 120,
+    use_sudo: bool = False,
+    stdin_text: Optional[str] = None,
+) -> str:
+    """Execute a multi-line script through SFTP; no heredoc wrapping is needed.
+
+    Use this tool for pipes, redirects, shell variables, embedded JSON, or any
+    command that would otherwise need nested quoting in ssh_execute_v2.
+    """
+    timing = _Timing()
+    try:
+        request = SSHScriptInput(
+            script_content=script,
+            name=name,
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            private_key_path=private_key_path,
+            interpreter=interpreter,
+            timeout=timeout,
+            use_sudo=use_sudo,
+            stdin_text=stdin_text,
+        )
+    except ValidationError as exc:
+        timing.mark("validate_fields")
+        timing.mark("attach_timing")
+        return json.dumps(
+            _attach_timing(_tool_error("validation", str(exc)), timing),
+            indent=2,
+            ensure_ascii=False,
+        )
+    timing.mark("validate_fields")
+    return await _script_request(request, timing)
 
 
 
@@ -1189,7 +1415,15 @@ async def ssh_execute_batch(params: str) -> str:
         block = _check_blocked(cmd)
         if block:
             return _attach_timing(
-                {"host": conn["host"], "name": entry.name, "success": False, "error": block},
+                {
+                    "host": conn["host"],
+                    "name": entry.name,
+                    **_tool_error(
+                        "policy",
+                        "Command rejected by the SSH-MCP safety policy.",
+                        policy_id=block["policy_id"],
+                    ),
+                },
                 host_timing,
             )
         async with sem:
