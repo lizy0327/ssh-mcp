@@ -9,9 +9,10 @@ for Hermes and other MCP clients. The source was cloned from
 `https://github.com/lizy0327/ssh-mcp` at commit
 `13dd761c0279b3dffc323b632fe3e62ed76dcc1c` (`main`). The optimization was
 committed and pushed as `8d15da808ff196276e31d484c29b267b99ffd8b1` on `main`,
-with capability-reporting follow-up `02efa7e`.
+with capability-reporting follow-up `02efa7e` and HTTP diagnostics release
+`a894e34ad61b0fd8f2f460eb8cc9daf1dc806099`.
 
-Release version: **2.5.1** (source validated; remote deployment pending)
+Release version: **2.5.1** (source validated and deployed)
 
 ## Implemented changes
 
@@ -67,15 +68,21 @@ file was backed up and the uploaded candidate passed
 `/opt/ssh-mcp/venv/bin/python3.11 -m py_compile`. The service was then restarted
 and verified active.
 
-Current live state before the 2.5.1 deployment:
+Current live state after the 2.5.1 deployment (2026-09-13):
 
-- Service: `ssh-mcp.service` is `active (running)`.
-- Remote `ssh_mcp_version`: `2.5.0`, SSE on port `9876`, host `vm70`.
-- Feature list includes `ssh_execute_v2` and `ssh_script_v2`.
+- Service: `ssh-mcp.service` is `active (running)` with `NRestarts=0`.
+- The process listens on `0.0.0.0:9876`; the host firewall allows `9876/tcp`.
+- `GET /healthz` passed both locally on vm70 and from the release workstation
+  (with the workstation HTTP proxy bypassed): status `ok`, version `2.5.1`,
+  transport `sse`.
+- The server journal confirms the existing client at `10.66.0.3` reconnected
+  to `GET /sse` after the restart.
+- Feature list from the previous 2.5.0 verification includes `ssh_execute_v2`
+  and `ssh_script_v2`; the new 2.5.1 code retains both.
 - Deployed source SHA-256:
-  `e8ce4ff34aabea1653e12ed2ccabdb92ba14d523a245b6e3fbabbfd599e72a7c`.
+  `8705de31b5f4a79f0549213e8f312e864177a869693b6f4a68d3dabf207c53f6`.
 - Latest rollback backup:
-  `/opt/ssh-mcp/ssh_mcp_server.py.bak.20260911_172158`.
+  `/opt/ssh-mcp/ssh_mcp_server.py.bak.20260913_133800`.
 
 ## Recommended release sequence
 
@@ -85,6 +92,7 @@ Current live state before the 2.5.1 deployment:
    regression cases before altering the calling rules again.
 3. Periodically prune only explicitly approved old backup files after confirming
    the new version is stable.
-4. Deploy 2.5.1 using the backup-and-atomic-replace sequence, then verify
-   `/healthz`, `ssh_mcp_version`, and a normal SDK MCP initialize/tools-list
-   exchange. Do not use raw JSON or `curl` as an MCP client test.
+4. On the next Hermes incident, extract only `transport_event` entries plus
+   the MCP client's structured error; then run a normal SDK MCP
+   initialize/tools-list exchange. Do not use raw JSON or `curl` as an MCP
+   client test. (`curl` is acceptable for the separate `/healthz` endpoint.)
