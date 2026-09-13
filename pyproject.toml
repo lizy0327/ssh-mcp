@@ -1,6 +1,6 @@
 [project]
 name = "ssh-mcp"
-version = "2.5.0"
+version = "2.5.1"
 description = "SSH MCP server - remote server management via SSH over MCP protocol"
 requires-python = ">=3.10"
 dependencies = [

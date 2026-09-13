@@ -1,6 +1,6 @@
 # SSH-MCP project status
 
-Updated: 2026-09-12
+Updated: 2026-09-13
 
 ## Scope completed in this workspace
 
@@ -11,7 +11,7 @@ for Hermes and other MCP clients. The source was cloned from
 committed and pushed as `8d15da808ff196276e31d484c29b267b99ffd8b1` on `main`,
 with capability-reporting follow-up `02efa7e`.
 
-Release version: **2.5.0**
+Release version: **2.5.1** (source validated; remote deployment pending)
 
 ## Implemented changes
 
@@ -33,6 +33,12 @@ Release version: **2.5.0**
   this project.
 - Retained the legacy `ssh_execute(params)` and `ssh_script(params)` tools for
   existing clients.
+- Added a cache-free `GET /healthz` endpoint that remains available even when
+  no MCP session can be established. It exposes only liveness/version/transport
+  data, never request content, credentials, or client identifiers.
+- Added safe `transport_event` journal records for malformed SSE messages and
+  HTTP errors. The service records no request body or query string in these
+  summaries; `ssh_mcp_version` exposes the restart-scoped parse-error counter.
 
 ## Validation completed
 
@@ -40,16 +46,18 @@ Executed successfully in the local virtual environment:
 
 ```text
 python -m unittest discover -s tests -v
-6 tests passed
+8 tests passed
 python -m py_compile ssh_mcp_server.py
 python ssh_mcp_server.py --version
-ssh-mcp 2.5.0
+ssh-mcp 2.5.1
 ```
 
 The tests assert that the live MCP schema exposes native v2 fields (and no
 `params` wrapper), stdin is written and closed, sudo does not inject a password
 into a shell command, policy identifiers are stable, and invalid legacy JSON
-returns a structured validation failure.
+returns a structured validation failure. The new tests also confirm that health
+checks work without an MCP session and malformed-message telemetry holds no
+payload.
 
 ## Deployment state
 
@@ -59,7 +67,7 @@ file was backed up and the uploaded candidate passed
 `/opt/ssh-mcp/venv/bin/python3.11 -m py_compile`. The service was then restarted
 and verified active.
 
-Current live state:
+Current live state before the 2.5.1 deployment:
 
 - Service: `ssh-mcp.service` is `active (running)`.
 - Remote `ssh_mcp_version`: `2.5.0`, SSE on port `9876`, host `vm70`.
@@ -77,3 +85,6 @@ Current live state:
    regression cases before altering the calling rules again.
 3. Periodically prune only explicitly approved old backup files after confirming
    the new version is stable.
+4. Deploy 2.5.1 using the backup-and-atomic-replace sequence, then verify
+   `/healthz`, `ssh_mcp_version`, and a normal SDK MCP initialize/tools-list
+   exchange. Do not use raw JSON or `curl` as an MCP client test.

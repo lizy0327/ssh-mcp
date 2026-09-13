@@ -23,6 +23,7 @@ import platform
 import re
 import shlex
 import sys
+import threading
 try:
     import fcntl
 except ImportError:
@@ -35,12 +36,13 @@ from typing import Optional
 import paramiko
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
+from starlette.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Version info
 # ---------------------------------------------------------------------------
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 # ---------------------------------------------------------------------------
 # Platform-aware configuration
@@ -120,7 +122,110 @@ _RUNTIME_INFO = {
     "transport": None,
     "host": None,
     "port": None,
+    "started_monotonic": None,
 }
+
+
+class _TransportTelemetry:
+    """Keep small, non-sensitive counters for MCP transport diagnostics."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._protocol_parse_errors = 0
+
+    def record_protocol_parse_error(self):
+        with self._lock:
+            self._protocol_parse_errors += 1
+
+    def snapshot(self):
+        with self._lock:
+            return {"protocol_parse_errors": self._protocol_parse_errors}
+
+    def reset(self):
+        """Reset counters. Used by regression tests only."""
+        with self._lock:
+            self._protocol_parse_errors = 0
+
+
+_TRANSPORT_TELEMETRY = _TransportTelemetry()
+
+
+class _McpParseErrorTelemetryHandler(logging.Handler):
+    """Count malformed SSE messages without ever logging their contents."""
+
+    def emit(self, record):
+        # FastMCP emits this once per malformed SSE message before it passes the
+        # parser's detailed exception through the normal logging chain.  Match
+        # the stable, high-level event only so one bad request counts once.
+        if record.name != "mcp.server.sse" or "Failed to parse message" not in record.getMessage():
+            return
+        _TRANSPORT_TELEMETRY.record_protocol_parse_error()
+        logger.warning(
+            "transport_event event=protocol_parse_error source=%s category=invalid_or_truncated_json",
+            record.name,
+        )
+
+
+def _install_transport_telemetry():
+    """Attach the parser counter once when an HTTP transport starts."""
+    source_logger = logging.getLogger("mcp.server.sse")
+    if any(isinstance(handler, _McpParseErrorTelemetryHandler) for handler in source_logger.handlers):
+        return
+    handler = _McpParseErrorTelemetryHandler(level=logging.ERROR)
+    source_logger.addHandler(handler)
+
+
+class _HttpErrorLogMiddleware:
+    """Log only failing HTTP requests, never request bodies or query strings."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = time.monotonic()
+        status = None
+
+        async def observed_send(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, observed_send)
+        finally:
+            if status is not None and status >= 400:
+                content_length = next(
+                    (
+                        value.decode("ascii", errors="replace")
+                        for key, value in scope.get("headers", [])
+                        if key.lower() == b"content-length"
+                    ),
+                    None,
+                )
+                logger.warning(
+                    "transport_event event=http_error method=%s path=%s status=%d duration_ms=%d content_length=%s",
+                    scope.get("method", "-"),
+                    scope.get("path", "-"),
+                    status,
+                    int((time.monotonic() - started) * 1000),
+                    content_length or "-",
+                )
+
+
+def _build_http_app(transport):
+    """Build an HTTP MCP app with observability that does not alter payloads."""
+    if transport == "sse":
+        app = mcp.sse_app()
+    elif transport == "streamable-http":
+        app = mcp.streamable_http_app()
+    else:
+        raise ValueError(f"HTTP app is not available for transport {transport!r}")
+    return _HttpErrorLogMiddleware(app)
 
 _ENABLE_TIMING = os.environ.get("SSH_MCP_TIMING", "1") != "0"
 _ENABLE_TIMING_DETAIL = os.environ.get("SSH_MCP_TIMING_DETAIL", "1") != "0"
@@ -618,6 +723,23 @@ def _parse_tool_params(params, model_cls):
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("ssh_mcp", host=SERVER_HOST, port=SERVER_PORT)
+
+
+@mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def healthz(request):
+    """Return a cache-free, credential-free liveness response for operators."""
+    started = _RUNTIME_INFO.get("started_monotonic")
+    uptime_seconds = None if started is None else round(time.monotonic() - started, 3)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": "ssh-mcp",
+            "version": __version__,
+            "transport": _RUNTIME_INFO.get("transport"),
+            "uptime_seconds": uptime_seconds,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2114,6 +2236,7 @@ async def ssh_mcp_version() -> str:
         "transport": _RUNTIME_INFO.get("transport"),
         "host": _RUNTIME_INFO.get("host"),
         "port": _RUNTIME_INFO.get("port"),
+        "transport_observability": _TRANSPORT_TELEMETRY.snapshot(),
         "credentials_file": CREDENTIALS_FILE,
         "credentials_exists": Path(CREDENTIALS_FILE).exists(),
         "hostname": platform.node(),
@@ -2174,6 +2297,7 @@ def main():
     _RUNTIME_INFO["transport"] = args.transport
     _RUNTIME_INFO["host"] = args.host if args.transport != "stdio" else None
     _RUNTIME_INFO["port"] = args.port if args.transport != "stdio" else None
+    _RUNTIME_INFO["started_monotonic"] = time.monotonic()
 
     if args.transport == "stdio":
         logger.info(
@@ -2196,8 +2320,18 @@ def main():
     if args.transport != "stdio":
         mcp._host = args.host
         mcp._port = args.port
+        _install_transport_telemetry()
+        import uvicorn
 
-    mcp.run(transport=args.transport)
+        uvicorn.run(
+            _build_http_app(args.transport),
+            host=args.host,
+            port=args.port,
+            log_level="info",
+        )
+        return
+
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

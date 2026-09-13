@@ -3,6 +3,22 @@
 All notable changes to ssh-mcp are recorded here. Bump `__version__` in
 `ssh_mcp_server.py` and `pyproject.toml` together when releasing.
 
+## [2.5.1] - 2026-09-13
+
+### Added
+- Unauthenticated but non-sensitive `GET /healthz` endpoint for liveness
+  checks when a broken MCP session cannot call a tool. Its response is
+  cache-free and contains only service/version/transport/uptime data.
+- Safe `transport_event` journal entries for malformed SSE protocol messages
+  and HTTP failures such as a client posting to `/sse`. These events never log
+  request bodies or query strings.
+- `transport_observability.protocol_parse_errors` in `ssh_mcp_version` and
+  regression coverage for the health endpoint and parse-error counter.
+
+### Changed
+- HTTP transports are run through a transparent ASGI wrapper that observes
+  failed status codes without consuming or modifying the MCP request stream.
+
 ## [2.5.0] - 2026-09-12
 
 ### Added

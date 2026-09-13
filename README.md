@@ -48,6 +48,36 @@ The v2 tools return a stable `error_type` on failures: `validation`, `policy`,
 Policy rejections include a `policy_id`, so callers must not try to evade them
 by changing shell quoting.
 
+## HTTP health and transport diagnostics
+
+The HTTP server exposes `GET /healthz`. It requires no MCP session and returns
+only non-sensitive liveness data (`status`, service version, selected transport,
+and uptime); it deliberately does not return host credentials, client/session
+identifiers, request bodies, or error text. Responses are marked `no-store` so
+an old browser or proxy response is not mistaken for current service state.
+
+For protocol failures, the service journal adds compact events without
+recording a request body or query string:
+
+```text
+transport_event event=protocol_parse_error ...
+transport_event event=http_error method=POST path=/sse status=405 ...
+```
+
+`ssh_mcp_version` also includes the in-process
+`transport_observability.protocol_parse_errors` counter. It starts at zero on
+each process restart and counts malformed SSE messages detected by FastMCP; it
+is a diagnostic signal, not a replacement for the journal. An operator can
+inspect only these safe summaries with:
+
+```bash
+journalctl -u ssh-mcp.service --since '1 hour ago' | grep 'transport_event'
+```
+
+Do not send MCP protocol JSON to `/healthz`, `/sse`, or `/messages/` by hand.
+Use a real MCP client which discovers the endpoint and follows the SSE URL it
+receives. `POST /sse` is intentionally invalid and will be logged as a 405.
+
 Examples:
 
 ```json
@@ -89,8 +119,9 @@ The skill runs `scripts/deploy_to_58_70.ps1`, which:
 3. Creates a timestamped backup on 58.70 (`ssh_mcp_server.py.bak.<ts>`).
 4. Uploads the new file via `scp` (OpenSSH client, Windows built-in).
 5. Restarts `ssh-mcp.service` via `systemctl`.
-6. Verifies the service is active and calls `ssh_mcp_version` to confirm the
-   new version is running.
+6. Verifies the service is active. The release operator then checks
+   `GET /healthz` and calls `ssh_mcp_version` to confirm the new version is
+   running.
 7. On failure, restores the backup and restarts.
 
 ### Prerequisites for deployment

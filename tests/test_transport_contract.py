@@ -5,9 +5,12 @@ import inspect
 import json
 import asyncio
 import io
+import logging
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
+
+from starlette.testclient import TestClient
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ssh_mcp_server.py"
@@ -79,6 +82,41 @@ class _FakeSFTP:
 
 
 class TransportContractTests(TestCase):
+    def test_healthz_is_available_without_an_mcp_session(self):
+        server._RUNTIME_INFO.update(
+            transport="sse",
+            host="127.0.0.1",
+            port=9876,
+            started_monotonic=server.time.monotonic() - 1,
+        )
+        with TestClient(server._build_http_app("sse")) as client:
+            response = client.get("/healthz")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["service"], "ssh-mcp")
+        self.assertEqual(body["version"], server.__version__)
+        self.assertEqual(body["transport"], "sse")
+        self.assertGreaterEqual(body["uptime_seconds"], 1)
+
+    def test_parse_error_telemetry_records_no_request_content(self):
+        server._TRANSPORT_TELEMETRY.reset()
+        handler = server._McpParseErrorTelemetryHandler()
+        record = logging.LogRecord(
+            name="mcp.server.sse",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="Failed to parse message",
+            args=(),
+            exc_info=None,
+        )
+        handler.emit(record)
+
+        self.assertEqual(server._TRANSPORT_TELEMETRY.snapshot(), {"protocol_parse_errors": 1})
+
     def test_v2_tools_expose_native_fields_not_a_params_wrapper(self):
         execute_fields = inspect.signature(server.ssh_execute_v2).parameters
         script_fields = inspect.signature(server.ssh_script_v2).parameters
